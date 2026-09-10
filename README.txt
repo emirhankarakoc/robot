@@ -1,102 +1,125 @@
-TFM V1.9 - RESPAWN-SAFE LIFE TIMER
-==================================
+TFM V1.11 - BEST ONLY
+=====================
 
-WHY V1.8 COULD STILL FAIL
--------------------------
-
-Some records/racing/training room implementations can respawn a player by
-sending a fresh PlayerUpdate activity=Alive WITHOUT first sending activity=Dead.
-
-V1.8 ignored Alive while it already believed the player was alive.
-
-Result:
-    failed attempt + next attempt could share one timer.
-
-Example symptom:
-    game completion ~16.75s
-    recorder life ~41s
-
-
-V1.9 RULE
+CORE RULE
 ---------
 
-A repeated:
+For one exact replay-compatible route key:
 
-    player-update -> activity=Alive
+    mapCode + mirrored + mapHash
 
-is treated as a NEW LIFE when it is separated from the previous Alive signal
-by at least 0.75 seconds.
+V1.11 keeps ONLY ONE record total.
 
-Normal same-spawn duplicate signals that arrive close together are ignored.
-
-So:
-
-    Alive
-      -> t0
-
-    ... player plays ...
-
-    death packet received
-      -> discard + reset
-
-OR, if Dead packet is missing:
-
-    later PlayerUpdate Alive
-      -> RESPAWN ALIVE PULSE
-      -> discard old attempt
-      -> new t0
+SELF and learned PLAYER/WINNER records compete against each other.
 
 
-SELF LOG
---------
-
-When the missing-Dead case happens:
-
-    [LIFE] RESPAWN ALIVE pulse without Dead -> FORCE RESET t=0
-    [RECORD LIFE] DEAD -> RESET t=0 source=respawn-alive-pulse ...
-    [RECORD LIFE] ALIVE -> t=0 life=... source=respawn-alive-pulse
-
-
-REMOTE LOG
+NEW RESULT
 ----------
 
-Same logic exists independently for every observed remote player:
+No record:
+    new successful run is saved
 
-    [REMOTE LIFE] Pedro#4565 ... RESPAWN ALIVE pulse -> RESET ...
-    [REMOTE LIFE] Pedro#4565 ... ALIVE -> t=0 life=...
+New run is faster:
+    previous SELF/PLAYER record is deleted
+    new run becomes the only BEST
 
-
-CHEESE TIMER VS COMPLETION TIMER
---------------------------------
-
-"You got the cheese in 7.808 seconds"
-
-is NOT the final records completion time.
-
-If the game says:
-
-    You completed map ... in 17.48 seconds
-
-then a recorder result around:
-
-    17.48s life
-
-is correct.
-
-V1.9 does NOT reset the life clock merely because cheese was collected.
+New run is slower or equal:
+    it is NOT saved
+    existing BEST stays untouched
 
 
-DATABASE
+EXAMPLES
 --------
 
-V1.9 uses:
+Existing:
+    Pedro#4565 17.486s
 
-    life_timer_version = 3
+New SELF:
+    16.750s
 
-V1.8 and older rows remain in robot_records.db but are ignored by autoplay.
+Result:
+    Pedro row deleted
+    SELF 16.750s is the only stored clean route
 
-This avoids selecting a V1.8 row whose timer accidentally included multiple
-lives.
+
+Existing:
+    SELF 16.750s
+
+New winner:
+    Pedro#4565 17.200s
+
+Result:
+    new Pedro run is ignored
+    SELF 16.750s remains
+
+
+OLD V1.10 DUPLICATES
+--------------------
+
+On startup V1.11 automatically compacts existing lifecycle-v3 data.
+
+For every exact map route key it retains only the fastest row across:
+
+    records
+    player_records
+
+
+TIMELIST
+--------
+
+Current map:
+
+    /timelist
+
+Specific map:
+
+    /timelist @7680000
+
+Output is ONE line only:
+
+    [V1.11] BEST @7680000 | 16.750s | SELF | R#12 | 57 pts
+
+or:
+
+    [V1.11] BEST @7680000 | 14.921s | Pedro#4565 | P#8 | 63 pts
+
+
+DELETE
+------
+
+Delete current map:
+
+    /timedelete
+
+Delete a specific map code:
+
+    /timedelete @7680000
+
+This removes both:
+    SELF records
+    PLAYER/winner records
+
+for that map code, including alternate hash/mirrored variants.
+
+
+Delete EVERYTHING:
+
+    /timedelete all
+
+
+PERSISTENT PLAY AFTER DELETE
+----------------------------
+
+If PLAY is ON and you delete the current map's BEST:
+
+    active replay is stopped
+    route is removed
+    current map becomes "no route"
+
+Then normal autolearn behavior applies:
+    play manually
+    record new successful run
+    learn a winner if another player is faster
 
 
 COMMANDS
@@ -115,3 +138,10 @@ COMMANDS
 
 /playplayer Nick#0000
 /playplayer off
+
+/timelist
+/timelist @mapCode
+
+/timedelete
+/timedelete @mapCode
+/timedelete all

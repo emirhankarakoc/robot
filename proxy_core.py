@@ -19,7 +19,7 @@ from winner_recorder import WinnerRecorder
 
 class TfmProxy(Proxy):
     """
-    TFM V1.9
+    TFM V1.11
 
     ONLY:
         /record on
@@ -101,7 +101,7 @@ class TfmProxy(Proxy):
         self.play_pending = False
 
         print(
-            "[PROXY] V1.9 listeners ready"
+            "[PROXY] V1.11 listeners ready"
         )
 
     # ==============================================================
@@ -356,7 +356,7 @@ class TfmProxy(Proxy):
         try:
             await conn.write_packet(
                 clientbound.GeneralMessagePacket,
-                message=f"<J>[V1.9]</J> {message}",
+                message=f"<J>[V1.11]</J> {message}",
             )
         except Exception as exc:
             print(
@@ -832,6 +832,169 @@ class TfmProxy(Proxy):
         )
 
         # --------------------------
+        # /timelist [@mapCode]
+        # BEST only
+        # --------------------------
+
+        if command == "timelist":
+            requested_map = None
+
+            if argument_raw is not None:
+                value = argument_raw.strip()
+
+                if value.startswith("@"):
+                    value = value[1:]
+
+                try:
+                    requested_map = int(value)
+                except ValueError:
+                    await self._chat(
+                        "usage: /timelist @7680000",
+                        source,
+                    )
+                    return self.DO_NOTHING
+
+            map_code = (
+                requested_map
+                if requested_map is not None
+                else self.current_map
+            )
+
+            if map_code is None:
+                await self._chat(
+                    "timelist failed: no current map; use /timelist @mapCode",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            item = self.store.get_time_best(
+                map_code=map_code,
+            )
+
+            if item is None:
+                await self._chat(
+                    f"BEST @{map_code} | no saved record",
+                    source,
+                )
+
+                print(
+                    f"[TIMELIST] @{map_code} EMPTY"
+                )
+
+                return self.DO_NOTHING
+
+            db_ref = (
+                f"R#{item['id']}"
+                if item["source"] == "SELF"
+                else f"P#{item['id']}"
+            )
+
+            line = (
+                f"BEST @{map_code} | "
+                f"{item['seconds']:.3f}s | "
+                f"{item['name']} | "
+                f"{db_ref} | "
+                f"{item['points']} pts"
+            )
+
+            print(
+                f"[TIMELIST] {line}"
+            )
+
+            await self._chat(
+                line,
+                source,
+            )
+
+            return self.DO_NOTHING
+
+        # --------------------------
+        # /timedelete
+        # /timedelete @mapCode
+        # /timedelete all
+        # --------------------------
+
+        if command == "timedelete":
+            if (
+                argument_raw is not None
+                and argument_raw.strip().lower()
+                == "all"
+            ):
+                deleted = self.store.delete_all()
+
+                # Do not keep a deleted route armed in memory.
+                self.replayer.stop(
+                    "timedelete-all"
+                )
+                self.selected_route = None
+                self.play_pending = False
+
+                await self._chat(
+                    f"TIMEDELETE ALL | deleted {deleted} row(s)",
+                    source,
+                )
+
+                return self.DO_NOTHING
+
+            requested_map = None
+
+            if argument_raw is not None:
+                value = argument_raw.strip()
+
+                if value.startswith("@"):
+                    value = value[1:]
+
+                try:
+                    requested_map = int(value)
+                except ValueError:
+                    await self._chat(
+                        "usage: /timedelete | /timedelete @7680000 | /timedelete all",
+                        source,
+                    )
+
+                    return self.DO_NOTHING
+
+            map_code = (
+                requested_map
+                if requested_map is not None
+                else self.current_map
+            )
+
+            if map_code is None:
+                await self._chat(
+                    "timedelete failed: no current map",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            deleted = self.store.delete_map(
+                map_code=map_code,
+            )
+
+            if (
+                self.current_map is not None
+                and int(map_code)
+                == int(self.current_map)
+            ):
+                self.replayer.stop(
+                    "timedelete-current-map"
+                )
+                self.selected_route = None
+                self.play_pending = False
+
+                # If persistent PLAY is ON, this map now has no record,
+                # so switch back to normal/manual autolearn.
+                if self.play_mode and self._map_context_ready():
+                    self._load_play_for_current_map()
+
+            await self._chat(
+                f"TIMEDELETE @{map_code} | deleted {deleted} row(s)",
+                source,
+            )
+
+            return self.DO_NOTHING
+
+        # --------------------------
         # /help
         # --------------------------
 
@@ -912,13 +1075,22 @@ class TfmProxy(Proxy):
                 ),
 
                 (
+                    "/timelist [@map] | sadece mevcut BEST kaydi gosterir."
+                ),
+
+                (
+                    "/timedelete [@map] | map kaydini siler. "
+                    "/timedelete all | tum kayitlari siler."
+                ),
+
+                (
                     "/help | bu listeyi gosterir."
                 ),
             ]
 
             print()
             print("=" * 54)
-            print(" TFM V1.9 HELP")
+            print(" TFM V1.11 HELP")
             print("=" * 54)
 
             for line in help_lines:
