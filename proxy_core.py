@@ -20,7 +20,7 @@ from winner_recorder import WinnerRecorder
 
 class TfmProxy(Proxy):
     """
-    TFM emirhankarakoc v1.6
+    TFM emirhankarakoc v1.10
 
     ONLY:
         /record on
@@ -120,8 +120,25 @@ class TfmProxy(Proxy):
         # PLAY waits until the first outgoing movement after Alive.
         self.play_pending = False
 
+        # /chatafterfirst
+        #
+        # Only fires when a SAVED replay actually started during this round
+        # and our session is the first finisher.
+        self.chat_after_first_enabled = False
+        self.chat_after_first_message = None
+        self.chat_after_first_sent_this_round = False
+        self.replay_started_this_round = False
+
+        # High-frequency terminal diagnostics are OFF by default.
+        # This avoids console I/O in movement hot paths.
+        self.debug_logs = False
+        self.recorder.set_debug_logs(False)
+        self.replayer.set_debug_logs(False)
+        self.player_recorder.set_debug_logs(False)
+        self.local_player_replayer.set_debug_logs(False)
+
         print(
-            "[PROXY] emirhankarakoc v1.6 listeners ready"
+            "[PROXY] emirhankarakoc v1.10 listeners ready"
         )
 
     # ==============================================================
@@ -447,6 +464,15 @@ class TfmProxy(Proxy):
             )
             self.play_pending = not started
 
+            if started:
+                self.replay_started_this_round = True
+                print(
+                    f"[REPLAY ROUND FLAG] "
+                    f"map=@{self.current_map} "
+                    "replayStartedThisRound=True "
+                    "source=afkfarming"
+                )
+
         await self._chat(
             f"AFKFARMING | winner route ready "
             f"@{self.current_map} | {owner} | "
@@ -654,6 +680,15 @@ class TfmProxy(Proxy):
 
                     self.play_pending = not started
 
+                    if started:
+                        self.replay_started_this_round = True
+                        print(
+                            f"[REPLAY ROUND FLAG] "
+                            f"map=@{self.current_map} "
+                            "replayStartedThisRound=True "
+                            "source=alive"
+                        )
+
         elif self.record_mode:
             self.recorder.on_alive(
                 observed_ns,
@@ -704,6 +739,112 @@ class TfmProxy(Proxy):
                     self.selected_route is not None
                 )
 
+    async def _send_room_message_to_backend(
+        self,
+        message,
+    ):
+        """
+        Send a REAL room chat message as the connected player.
+
+        This is different from _chat(), which only shows a local proxy/status
+        line in the game client.
+        """
+        text = str(message).strip()
+
+        if not text:
+            print(
+                "[CHATAFTERFIRST] SEND SKIP empty message"
+            )
+            return False
+
+        source_conn = self.serverbound_source
+
+        if (
+            source_conn is None
+            or source_conn.destination is None
+        ):
+            print(
+                "[CHATAFTERFIRST] SEND FAILED no backend connection"
+            )
+            return False
+
+        try:
+            packet = serverbound.RoomMessagePacket(
+                message=text,
+            )
+
+            print(
+                "[TX->SERVER] "
+                f"packet={type(packet).__name__} "
+                f"reason=chatafterfirst "
+                f"message={text!r}"
+            )
+
+            await (
+                source_conn.destination
+                .write_packet_instance(
+                    packet
+                )
+            )
+
+            print(
+                "[CHATAFTERFIRST] SENT "
+                f"map=@{self.current_map} "
+                f"message={text!r}"
+            )
+
+            return True
+
+        except Exception as exc:
+            print(
+                "[CHATAFTERFIRST ERROR] "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+    async def _maybe_chat_after_first(
+        self,
+        *,
+        winner_session_id,
+    ):
+        """
+        Fire once per round only when:
+          - feature ON
+          - configured message exists
+          - saved replay actually STARTED this round
+          - first victory belongs to our session
+        """
+        if not self.chat_after_first_enabled:
+            return False
+
+        if not self.chat_after_first_message:
+            return False
+
+        if self.chat_after_first_sent_this_round:
+            return False
+
+        if not self.replay_started_this_round:
+            print(
+                "[CHATAFTERFIRST] SKIP "
+                "first place was not from a started saved replay"
+            )
+            return False
+
+        if self.self_session_id is None:
+            return False
+
+        if int(winner_session_id) != int(self.self_session_id):
+            return False
+
+        sent = await self._send_room_message_to_backend(
+            self.chat_after_first_message
+        )
+
+        if sent:
+            self.chat_after_first_sent_this_round = True
+
+        return sent
+
     async def _chat(self, message, source=None):
         """
         Show proxy command/status messages inside the game client.
@@ -717,7 +858,7 @@ class TfmProxy(Proxy):
         try:
             await conn.write_packet(
                 clientbound.GeneralMessagePacket,
-                message=f"<J>[emirhankarakoc v1.6]</J> {message}",
+                message=f"<J>[emirhankarakoc v1.10]</J> {message}",
             )
         except Exception as exc:
             print(
@@ -1055,6 +1196,9 @@ class TfmProxy(Proxy):
         self.play_pending = False
         self.afk_waiting_for_route = False
 
+        self.chat_after_first_sent_this_round = False
+        self.replay_started_this_round = False
+
         # ALWAYS show the currently usable record at hand start.
         round_best = self.store.get_best_any_route(
             map_code=self.current_map,
@@ -1264,6 +1408,153 @@ class TfmProxy(Proxy):
             if argument_raw is not None
             else None
         )
+
+        # --------------------------
+        # /debuglogs on|off
+        # --------------------------
+
+        if command == "debuglogs":
+            if argument is None:
+                await self._chat(
+                    f"DEBUGLOGS={'ON' if self.debug_logs else 'OFF'}",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            if argument in ("on", "start"):
+                enabled = True
+            elif argument in ("off", "stop"):
+                enabled = False
+            else:
+                await self._chat(
+                    "usage: /debuglogs on | off",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            self.debug_logs = enabled
+            self.recorder.set_debug_logs(enabled)
+            self.replayer.set_debug_logs(enabled)
+            self.player_recorder.set_debug_logs(enabled)
+            self.local_player_replayer.set_debug_logs(enabled)
+
+            state = "ON" if enabled else "OFF"
+
+            print(
+                f"[DEBUGLOGS] {state} | "
+                "movement packet/position terminal logs "
+                f"{'enabled' if enabled else 'suppressed'}"
+            )
+
+            await self._chat(
+                f"DEBUGLOGS {state}",
+                source,
+            )
+
+            return self.DO_NOTHING
+
+        # --------------------------
+        # /chatafterfirst
+        # /chatafterfirst on
+        # /chatafterfirst off
+        # /chatafterfirst [message]
+        # --------------------------
+
+        if command == "chatafterfirst":
+            if argument_raw is None:
+                status = (
+                    "ON"
+                    if self.chat_after_first_enabled
+                    else "OFF"
+                )
+
+                configured = (
+                    self.chat_after_first_message
+                    if self.chat_after_first_message
+                    else "<not set>"
+                )
+
+                await self._chat(
+                    f"CHATAFTERFIRST={status} | "
+                    f"message={configured}",
+                    source,
+                )
+
+                print(
+                    f"[CHATAFTERFIRST] "
+                    f"status={status} "
+                    f"message={configured!r}"
+                )
+
+                return self.DO_NOTHING
+
+            if argument == "off":
+                self.chat_after_first_enabled = False
+
+                await self._chat(
+                    "CHATAFTERFIRST OFF",
+                    source,
+                )
+
+                print(
+                    "[CHATAFTERFIRST] OFF"
+                )
+
+                return self.DO_NOTHING
+
+            if argument == "on":
+                if not self.chat_after_first_message:
+                    await self._chat(
+                        "CHATAFTERFIRST has no message. "
+                        "Use /chatafterfirst your message first.",
+                        source,
+                    )
+
+                    print(
+                        "[CHATAFTERFIRST] ON FAILED no message configured"
+                    )
+
+                    return self.DO_NOTHING
+
+                self.chat_after_first_enabled = True
+
+                await self._chat(
+                    f"CHATAFTERFIRST ON | "
+                    f"message={self.chat_after_first_message}",
+                    source,
+                )
+
+                print(
+                    "[CHATAFTERFIRST] ON "
+                    f"message={self.chat_after_first_message!r}"
+                )
+
+                return self.DO_NOTHING
+
+            # Any other argument is the message itself.
+            message = argument_raw.strip()
+
+            if not message:
+                await self._chat(
+                    "usage: /chatafterfirst on | off | [message]",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            self.chat_after_first_message = message
+            self.chat_after_first_enabled = True
+
+            await self._chat(
+                f"CHATAFTERFIRST ON | message={message}",
+                source,
+            )
+
+            print(
+                "[CHATAFTERFIRST] MESSAGE SET + ON "
+                f"message={message!r}"
+            )
+
+            return self.DO_NOTHING
 
         # --------------------------
         # /afkfarming on|off
@@ -1685,6 +1976,18 @@ class TfmProxy(Proxy):
                 else "OFF"
             )
 
+            chat_first_status = (
+                "ON"
+                if self.chat_after_first_enabled
+                else "OFF"
+            )
+
+            debug_status = (
+                "ON"
+                if self.debug_logs
+                else "OFF"
+            )
+
             recordplayer_target = (
                 self.player_recorder.target_name
             )
@@ -1702,7 +2005,9 @@ class TfmProxy(Proxy):
                 (
                     f"STATUS | RECORD={record_status} "
                     f"| PLAY={play_status} "
-                    f"| AFKFARMING={afk_status}"
+                    f"| AFKFARMING={afk_status} "
+                    f"| CHATAFTERFIRST={chat_first_status} "
+                    f"| DEBUGLOGS={debug_status}"
                 ),
 
                 (
@@ -1750,6 +2055,16 @@ class TfmProxy(Proxy):
                 ),
 
                 (
+                    "/debuglogs on/off | movement packet ve position "
+                    "terminal spamini acar/kapatir. Default=OFF."
+                ),
+
+                (
+                    "/chatafterfirst on/off/[message] | saved replay ile "
+                    "1. olursan room chate otomatik mesaj yollar."
+                ),
+
+                (
                     "/afkfarming on/off | run yoksa 1 jump at 5s; "
                     "ilk uygun winner gelince aninda replay."
                 ),
@@ -1779,7 +2094,7 @@ class TfmProxy(Proxy):
 
             print()
             print("=" * 54)
-            print(" TFM emirhankarakoc v1.6 HELP")
+            print(" TFM emirhankarakoc v1.10 HELP")
             print("=" * 54)
 
             for line in help_lines:
@@ -1955,6 +2270,15 @@ class TfmProxy(Proxy):
             self.play_pending = not started
 
             if started:
+                self.replay_started_this_round = True
+
+                print(
+                    f"[REPLAY ROUND FLAG] "
+                    f"map=@{self.current_map} "
+                    "replayStartedThisRound=True "
+                    "source=playplayer"
+                )
+
                 await self._chat(
                     f"playplayer ON: {argument_raw} | "
                     f"{len(record.get('events', []))} points | "
@@ -2249,6 +2573,16 @@ class TfmProxy(Proxy):
                     not started
                 )
 
+                if started:
+                    self.replay_started_this_round = True
+
+                    print(
+                        f"[REPLAY ROUND FLAG] "
+                        f"map=@{self.current_map} "
+                        "replayStartedThisRound=True "
+                        "source=movement"
+                    )
+
             if self.replayer.is_active():
                 return self.DO_NOTHING
 
@@ -2512,6 +2846,10 @@ class TfmProxy(Proxy):
                         f"owner={self.self_name} "
                         f"serverTime={float(packet.seconds):.3f}s "
                         "source=self"
+                    )
+
+                    await self._maybe_chat_after_first(
+                        winner_session_id=winner_session_id,
                     )
 
                 elif winner_record is not None:

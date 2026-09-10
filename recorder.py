@@ -5,7 +5,7 @@ import time
 
 class Recorder:
     """
-    V1.9 SELF recorder.
+    V1.10 SELF recorder.
 
     The important rule is:
         EVERY LIFE HAS ITS OWN CLOCK.
@@ -41,11 +41,15 @@ class Recorder:
         self.life_index = 0
 
         self.facing_right = True
+        self.debug_logs = False
 
         print(
             "[RECORDER] emirhankarakoc v1.2 ready "
             "(life timer resets on every death)"
         )
+
+    def set_debug_logs(self, enabled):
+        self.debug_logs = bool(enabled)
 
     @staticmethod
     def _enum_value(value):
@@ -313,16 +317,17 @@ class Recorder:
 
             life_index = self.life_index
 
-        print(
-            f"[REC POS] "
-            f"life={life_index} "
-            f"{t_us / 1_000_000:.6f}s "
-            f"x={event['x']:.2f} "
-            f"y={event['y']:.2f} "
-            f"vx={event['velocityX']:.2f} "
-            f"vy={event['velocityY']:.2f} "
-            f"face={'R' if event['facingRight'] else 'L'}"
-        )
+        if self.debug_logs:
+            print(
+                f"[REC POS] "
+                f"life={life_index} "
+                f"{t_us / 1_000_000:.6f}s "
+                f"x={event['x']:.2f} "
+                f"y={event['y']:.2f} "
+                f"vx={event['velocityX']:.2f} "
+                f"vy={event['velocityY']:.2f} "
+                f"face={'R' if event['facingRight'] else 'L'}"
+            )
 
         return True
 

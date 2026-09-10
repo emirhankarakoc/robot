@@ -5,7 +5,7 @@ import time
 
 class PlayerRecorder:
     """
-    V1.9 passive recorder for one selected REMOTE player.
+    V1.10 passive recorder for one selected REMOTE player.
 
     Every life has its own clock.
 
@@ -45,8 +45,11 @@ class PlayerRecorder:
         self.alive_signal_debounce_ns = 750_000_000  # 0.75 s
 
         print(
-            "[PLAYER RECORDER] V1.9 passive life recorder ready"
+            "[PLAYER RECORDER] V1.10 passive life recorder ready"
         )
+
+    def set_debug_logs(self, enabled):
+        self.debug_logs = bool(enabled)
 
     @property
     def enabled(self):
@@ -256,6 +259,7 @@ class PlayerRecorder:
             self.anchor_ns = None
             self.events = []
             self.facing_right = True
+        self.debug_logs = False
 
         print(
             f"[PLAYER LIFE] {target} "
@@ -418,16 +422,17 @@ class PlayerRecorder:
             target = self.target_name
             life = self.life_index
 
-        print(
-            f"[WATCH POS] {target} "
-            f"life={life} "
-            f"{t_us / 1_000_000:.6f}s "
-            f"x={event['x']:.2f} "
-            f"y={event['y']:.2f} "
-            f"vx={event['velocityX']:.2f} "
-            f"vy={event['velocityY']:.2f} "
-            f"face={'R' if event['facingRight'] else 'L'}"
-        )
+        if self.debug_logs:
+            print(
+                f"[WATCH POS] {target} "
+                f"life={life} "
+                f"{t_us / 1_000_000:.6f}s "
+                f"x={event['x']:.2f} "
+                f"y={event['y']:.2f} "
+                f"vx={event['velocityX']:.2f} "
+                f"vy={event['velocityY']:.2f} "
+                f"face={'R' if event['facingRight'] else 'L'}"
+            )
 
         return event
 

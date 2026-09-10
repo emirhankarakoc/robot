@@ -8,7 +8,7 @@ SATELLITE_PORT = 12801
 
 def main():
     print("=" * 62)
-    print(" emirhankarakoc v1.6 - RECORD / RACING / AUTOLEARN")
+    print(" emirhankarakoc v1.10 - RECORD / RACING / AUTOLEARN")
     print("=" * 62)
     print(f"[LISTEN] MAIN      {HOST}:{MAIN_PORT}")
     print(f"[LISTEN] SATELLITE {HOST}:{SATELLITE_PORT}")
@@ -19,6 +19,8 @@ def main():
     print("[COMMAND] /help")
     print("[COMMAND] /record on | off")
     print("[COMMAND] /play on | off")
+    print("[COMMAND] /debuglogs on | off")
+    print("[COMMAND] /chatafterfirst on | off | [message]")
     print("[COMMAND] /afkfarming on | off")
     print("[COMMAND] /recordplayer Nick#0000 | off")
     print("[COMMAND] /playplayer Nick#0000 | off")

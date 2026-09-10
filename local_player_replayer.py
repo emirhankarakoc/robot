@@ -19,10 +19,14 @@ class LocalPlayerReplayer:
         self.task = None
         self.active = False
         self.generation = 0
+        self.debug_logs = False
 
         print(
             "[PLAYPLAYER] local-only replayer ready"
         )
+
+    def set_debug_logs(self, enabled):
+        self.debug_logs = bool(enabled)
 
     def arm(self, record):
         self.record = record
@@ -112,13 +116,14 @@ class LocalPlayerReplayer:
                     f"{type(exc).__name__}: {exc}"
                 )
 
-        print(
-            f"[PLAYPLAYER POS] "
-            f"{event.get('tUs', 0) / 1_000_000:.6f}s "
-            f"x={x} y={y} "
-            f"face="
-            f"{'R' if event.get('facingRight', True) else 'L'}"
-        )
+        if self.debug_logs:
+            print(
+                f"[PLAYPLAYER POS] "
+                f"{event.get('tUs', 0) / 1_000_000:.6f}s "
+                f"x={x} y={y} "
+                f"face="
+                f"{'R' if event.get('facingRight', True) else 'L'}"
+            )
 
     async def _run(
         self,

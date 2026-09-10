@@ -1,4 +1,4 @@
-emirhankarakoc v1.6
+emirhankarakoc v1.10
 ===================
 
 CHAT PREFIX
@@ -6,7 +6,7 @@ CHAT PREFIX
 
 All proxy-generated in-game messages use:
 
-    [emirhankarakoc v1.6]
+    [emirhankarakoc v1.10]
 
 The old [V1.xx] prefix is gone.
 
@@ -359,3 +359,139 @@ Single map:
     BEST @7680000 | 14.921s | Pedro#4565 | 63 pts
 
 Database row IDs are no longer shown in chat/terminal timelist output.
+
+
+V1.7 - CHATAFTERFIRST
+=====================
+
+Commands:
+
+    /chatafterfirst GG
+        sets message to "GG" and turns feature ON
+
+    /chatafterfirst nice run :)
+        sets the full message and turns feature ON
+
+    /chatafterfirst off
+        disables automatic message
+
+    /chatafterfirst on
+        enables the previously configured message
+
+    /chatafterfirst
+        shows current status + configured message
+
+
+WHEN IT FIRES
+-------------
+
+It sends a REAL RoomMessagePacket to the backend only when ALL are true:
+
+    feature is ON
+    a message is configured
+    a SAVED replay actually STARTED during this round
+    our session is the FIRST finisher
+    message was not already sent this round
+
+It does NOT fire for:
+
+    manual run
+    recording/autolearn fallback without a replay start
+    second / third / later place
+    replay that was only armed but never started
+
+
+TERMINAL LOG
+------------
+
+When a saved replay starts:
+
+    [REPLAY ROUND FLAG] ... replayStartedThisRound=True
+
+When first place triggers chat:
+
+    [TX->SERVER] packet=RoomMessagePacket reason=chatafterfirst message='GG'
+    [CHATAFTERFIRST] SENT map=@1234567 message='GG'
+
+
+V1.8 FINAL CHECKPOINT
+=====================
+terminalHold is metadata only and is not sent as a normal replay packet.
+Finish-drive begins from the last REAL checkpoint.
+Also imports statistics to fix the runtime NameError.
+
+
+V1.9 - NATURAL FINISH
+=====================
+
+The old FINISH DRIVE is disabled.
+
+Why:
+    The final REAL recorded PlayerMovementPacket already contains the
+    winner's real position, velocity, jump state and movement flags.
+
+    After that packet, the original winner's backend physics naturally
+    continued until PlayerVictoryPacket.
+
+    Synthetic finish-drive packets were repeatedly overwriting x/y and
+    velocity after the real route ended. This could make the replay stick
+    beside the hole or move away from it.
+
+New flow:
+
+    REAL checkpoint 1
+    REAL checkpoint 2
+    ...
+    LAST REAL checkpoint
+    terminalHold metadata -> NOT transmitted
+    finish-drive -> NOT transmitted
+    no more movement packets
+    backend/client physics naturally coast
+    wait for PlayerVictoryPacket or death
+
+Expected log:
+
+    [PLAY] terminalHold checkpoint skipped count=1
+    [PLAY END] last REAL checkpoint sent | x=... y=... vx=... vy=...
+    [PLAY] trajectory complete; NO synthetic finish packets; letting backend physics coast; waiting for victory/death
+
+There should be NO:
+    reason=finish-drive-1
+    reason=finish-drive-2
+    ...
+after the recorded route ends.
+
+
+V1.10 - DEBUGLOGS / LOW-CONSOLE-OVERHEAD MODE
+==============================================
+
+Default:
+    DEBUGLOGS=OFF
+
+Commands:
+    /debuglogs
+    /debuglogs on
+    /debuglogs off
+
+OFF suppresses high-frequency terminal output such as:
+    [REC POS]
+    [WATCH POS]
+    [TX->SERVER] replay movement packet details
+    [BACKEND WRITE OK]
+    [TX->CLIENT] local movement/facing details
+    [LOCAL MIRROR]
+    [PLAY POS]
+    [PLAYPLAYER POS]
+
+Important lifecycle / result logs stay visible:
+    NEW ROUND / MAP
+    PLAY START / STOP
+    RECORD armed / saved
+    BEST hit / miss / overwrite
+    FIRST PLACE
+    VICTORY / DEATH
+    AFKFARMING state
+    errors
+
+This changes logging only. Packet timing, replay data, recording,
+backend forwarding and local mirroring are unchanged.

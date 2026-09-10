@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import statistics
 import os
 import ctypes
 
@@ -13,7 +14,7 @@ from caseus.packets.common import (
 
 class Replayer:
     """
-    emirhankarakoc v1.6 replay.
+    emirhankarakoc v1.10 replay.
 
     Sends ONLY saved PlayerMovementPacket states to the backend,
     at the SAME recorded timestamps.
@@ -28,6 +29,7 @@ class Replayer:
         self.task = None
         self.active = False
         self.generation = 0
+        self.debug_logs = False
 
         if os.name == "nt":
             try:
@@ -38,7 +40,7 @@ class Replayer:
                 pass
 
         print(
-            "[PLAYER] emirhankarakoc v1.6 ready "
+            "[PLAYER] emirhankarakoc v1.10 ready "
             "(recorded coordinates -> backend + local mirror)"
         )
 
@@ -59,6 +61,9 @@ class Replayer:
         )
 
         return True
+
+    def set_debug_logs(self, enabled):
+        self.debug_logs = bool(enabled)
 
     def is_active(self):
         return bool(
@@ -211,13 +216,16 @@ class Replayer:
             rotation_info=rotation,
         )
 
-    @staticmethod
     def _log_server_packet(
+        self,
         packet,
         event,
         *,
         reason="replay",
     ):
+        if not self.debug_logs:
+            return
+
         print(
             "[TX->SERVER] "
             f"packet={type(packet).__name__} "
@@ -589,11 +597,12 @@ class Replayer:
             velocity_relative=False,
         )
 
-        print(
-            "[TX->CLIENT] "
-            f"packet={type(local_move).__name__} "
-            f"x={x} y={y} vx={vx} vy={vy}"
-        )
+        if self.debug_logs:
+            print(
+                "[TX->CLIENT] "
+                f"packet={type(local_move).__name__} "
+                f"x={x} y={y} vx={vx} vy={vy}"
+            )
 
         await source_conn.write_packet_instance(
             local_move
@@ -613,12 +622,13 @@ class Replayer:
                     ),
                 )
 
-                print(
-                    "[TX->CLIENT] "
-                    f"packet={type(face_packet).__name__} "
-                    f"session={self_session_id} "
-                    f"facingRight={bool(event.get('facingRight', True))}"
-                )
+                if self.debug_logs:
+                    print(
+                        "[TX->CLIENT] "
+                        f"packet={type(face_packet).__name__} "
+                        f"session={self_session_id} "
+                        f"facingRight={bool(event.get('facingRight', True))}"
+                    )
 
                 await source_conn.write_packet_instance(
                     face_packet
@@ -629,14 +639,15 @@ class Replayer:
                     f"{type(exc).__name__}: {exc}"
                 )
 
-        print(
-            f"[LOCAL MIRROR] "
-            f"{event.get('tUs', 0) / 1_000_000:.6f}s "
-            f"x={x:.2f} "
-            f"y={y:.2f} "
-            f"face="
-            f"{'R' if event.get('facingRight', True) else 'L'}"
-        )
+        if self.debug_logs:
+            print(
+                f"[LOCAL MIRROR] "
+                f"{event.get('tUs', 0) / 1_000_000:.6f}s "
+                f"x={x:.2f} "
+                f"y={y:.2f} "
+                f"face="
+                f"{'R' if event.get('facingRight', True) else 'L'}"
+            )
 
     async def _run(
         self,
@@ -650,10 +661,36 @@ class Replayer:
         loop = asyncio.get_running_loop()
 
         try:
-            for event in self.record.get(
+            events = self.record.get(
                 "events",
                 [],
-            ):
+            )
+
+            # terminalHold is metadata only. Replaying it as a normal
+            # checkpoint can resend an older x/y and pull the player back.
+            play_events = [
+                event
+                for event in events
+                if not bool(
+                    event.get(
+                        "terminalHold",
+                        False,
+                    )
+                )
+            ]
+
+            if not play_events:
+                play_events = events
+
+            skipped_terminal = len(events) - len(play_events)
+
+            if skipped_terminal:
+                print(
+                    f"[PLAY] terminalHold checkpoint skipped "
+                    f"count={skipped_terminal}"
+                )
+
+            for event in play_events:
                 if (
                     not self.active
                     or generation
@@ -708,12 +745,13 @@ class Replayer:
                     )
                 )
 
-                print(
-                    f"[BACKEND WRITE OK] "
-                    f"{event.get('tUs', 0) / 1_000_000:.6f}s "
-                    f"x={event.get('x', 0.0):.2f} "
-                    f"y={event.get('y', 0.0):.2f}"
-                )
+                if self.debug_logs:
+                    print(
+                        f"[BACKEND WRITE OK] "
+                        f"{event.get('tUs', 0) / 1_000_000:.6f}s "
+                        f"x={event.get('x', 0.0):.2f} "
+                        f"y={event.get('y', 0.0):.2f}"
+                    )
 
                 # Local display must never kill backend replay.
                 try:
@@ -728,34 +766,46 @@ class Replayer:
                         f"{type(exc).__name__}: {exc}"
                     )
 
+                if self.debug_logs:
+                    print(
+                        f"[PLAY POS] "
+                        f"{event.get('tUs', 0) / 1_000_000:.6f}s "
+                        f"x={event.get('x', 0.0):.2f} "
+                        f"y={event.get('y', 0.0):.2f} "
+                        f"face="
+                        f"{'R' if event.get('facingRight', True) else 'L'}"
+                    )
+
+            # IMPORTANT V1.9:
+            #
+            # Do NOT send terminalHold again.
+            # Do NOT synthesize finish-drive checkpoints.
+            #
+            # The final REAL packet already contains the real velocity,
+            # jump state and movement state that the winner had immediately
+            # before the server produced PlayerVictoryPacket.
+            #
+            # Sending extra x/y packets here can overwrite natural physics
+            # and make the character stick beside / move away from the hole.
+            if play_events:
+                last_real = play_events[-1]
+
                 print(
-                    f"[PLAY POS] "
-                    f"{event.get('tUs', 0) / 1_000_000:.6f}s "
-                    f"x={event.get('x', 0.0):.2f} "
-                    f"y={event.get('y', 0.0):.2f} "
-                    f"face="
-                    f"{'R' if event.get('facingRight', True) else 'L'}"
-                )
-
-            events = self.record.get(
-                "events",
-                [],
-            )
-
-            if (
-                events
-                and bool(events[-1].get("terminalHold", False))
-            ):
-                await self._finish_drive(
-                    events=events,
-                    generation=generation,
-                    round_id=round_id,
-                    source_conn=source_conn,
-                    self_session_id=self_session_id,
+                    "[PLAY END] "
+                    "last REAL checkpoint sent | "
+                    f"x={float(last_real.get('x', 0.0)):.2f} "
+                    f"y={float(last_real.get('y', 0.0)):.2f} "
+                    f"vx={float(last_real.get('velocityX', 0.0)):.2f} "
+                    f"vy={float(last_real.get('velocityY', 0.0)):.2f} "
+                    f"L={bool(last_real.get('movingLeft', False))} "
+                    f"R={bool(last_real.get('movingRight', False))} "
+                    f"jump={bool(last_real.get('jumping', False))}"
                 )
 
             print(
                 "[PLAY] trajectory complete; "
+                "NO synthetic finish packets; "
+                "letting backend physics coast; "
                 "waiting for victory/death"
             )
 

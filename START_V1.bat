@@ -1,16 +1,18 @@
 @echo off
 cd /d "%~dp0"
 
-title emirhankarakoc v1.6
+title emirhankarakoc v1.10
 
 echo ==============================================================
-echo  emirhankarakoc v1.6 - RECORD / RACING / AUTOLEARN
+echo  emirhankarakoc v1.10 - RECORD / RACING / AUTOLEARN
 echo ==============================================================
 echo.
 echo Commands:
 echo   /help
 echo   /record on ^| off
 echo   /play on ^| off
+echo   /debuglogs on ^| off
+echo   /chatafterfirst on ^| off ^| [message]
 echo   /afkfarming on ^| off
 echo   /recordplayer Nick#0000 ^| off
 echo   /playplayer Nick#0000 ^| off
