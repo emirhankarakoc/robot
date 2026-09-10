@@ -13,7 +13,7 @@ from caseus.packets.common import (
 
 class Replayer:
     """
-    emirhankarakoc v1.4 replay.
+    emirhankarakoc v1.6 replay.
 
     Sends ONLY saved PlayerMovementPacket states to the backend,
     at the SAME recorded timestamps.
@@ -38,7 +38,7 @@ class Replayer:
                 pass
 
         print(
-            "[PLAYER] emirhankarakoc v1.4 ready "
+            "[PLAYER] emirhankarakoc v1.6 ready "
             "(recorded coordinates -> backend + local mirror)"
         )
 

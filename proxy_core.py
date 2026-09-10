@@ -20,7 +20,7 @@ from winner_recorder import WinnerRecorder
 
 class TfmProxy(Proxy):
     """
-    TFM emirhankarakoc v1.4
+    TFM emirhankarakoc v1.6
 
     ONLY:
         /record on
@@ -121,7 +121,7 @@ class TfmProxy(Proxy):
         self.play_pending = False
 
         print(
-            "[PROXY] emirhankarakoc v1.4 listeners ready"
+            "[PROXY] emirhankarakoc v1.6 listeners ready"
         )
 
     # ==============================================================
@@ -717,7 +717,7 @@ class TfmProxy(Proxy):
         try:
             await conn.write_packet(
                 clientbound.GeneralMessagePacket,
-                message=f"<J>[emirhankarakoc v1.4]</J> {message}",
+                message=f"<J>[emirhankarakoc v1.6]</J> {message}",
             )
         except Exception as exc:
             print(
@@ -1493,32 +1493,57 @@ class TfmProxy(Proxy):
         # --------------------------
 
         if command == "timelist":
-            requested_map = None
+            # No argument -> list ALL saved maps.
+            if argument_raw is None:
+                items = self.store.get_all_time_bests()
 
-            if argument_raw is not None:
-                value = argument_raw.strip()
-
-                if value.startswith("@"):
-                    value = value[1:]
-
-                try:
-                    requested_map = int(value)
-                except ValueError:
+                if not items:
+                    print("[TIMELIST] EMPTY")
                     await self._chat(
-                        "usage: /timelist @7680000",
+                        "TIMELIST | no saved records",
                         source,
                     )
                     return self.DO_NOTHING
 
-            map_code = (
-                requested_map
-                if requested_map is not None
-                else self.current_map
-            )
+                print()
+                print("=" * 72)
+                print(f" TIMELIST | {len(items)} SAVED MAP(S)")
+                print("=" * 72)
 
-            if map_code is None:
                 await self._chat(
-                    "timelist failed: no current map; use /timelist @mapCode",
+                    f"TIMELIST | {len(items)} map(s)",
+                    source,
+                )
+
+                for item in items:
+                    line = (
+                        f"@{item['mapCode']} | "
+                        f"{item['seconds']:.3f}s | "
+                        f"{item['name']} | "
+                        f"{item['points']} pts"
+                    )
+
+                    print(line)
+                    await self._chat(
+                        line,
+                        source,
+                    )
+
+                print("=" * 72)
+                print()
+                return self.DO_NOTHING
+
+            # With @map -> single map BEST.
+            value = argument_raw.strip()
+
+            if value.startswith("@"):
+                value = value[1:]
+
+            try:
+                map_code = int(value)
+            except ValueError:
+                await self._chat(
+                    "usage: /timelist | /timelist @7680000",
                     source,
                 )
                 return self.DO_NOTHING
@@ -1528,34 +1553,21 @@ class TfmProxy(Proxy):
             )
 
             if item is None:
+                print(f"[TIMELIST] @{map_code} EMPTY")
                 await self._chat(
                     f"BEST @{map_code} | no saved record",
                     source,
                 )
-
-                print(
-                    f"[TIMELIST] @{map_code} EMPTY"
-                )
-
                 return self.DO_NOTHING
-
-            db_ref = (
-                f"R#{item['id']}"
-                if item["source"] == "SELF"
-                else f"P#{item['id']}"
-            )
 
             line = (
                 f"BEST @{map_code} | "
                 f"{item['seconds']:.3f}s | "
                 f"{item['name']} | "
-                f"{db_ref} | "
                 f"{item['points']} pts"
             )
 
-            print(
-                f"[TIMELIST] {line}"
-            )
+            print(f"[TIMELIST] {line}")
 
             await self._chat(
                 line,
@@ -1752,7 +1764,7 @@ class TfmProxy(Proxy):
                 ),
 
                 (
-                    "/timelist [@map] | sadece mevcut BEST kaydi gosterir."
+                    "/timelist | tum kayitli mapleri gosterir. /timelist @map | tek map BEST."
                 ),
 
                 (
@@ -1767,7 +1779,7 @@ class TfmProxy(Proxy):
 
             print()
             print("=" * 54)
-            print(" TFM emirhankarakoc v1.4 HELP")
+            print(" TFM emirhankarakoc v1.6 HELP")
             print("=" * 54)
 
             for line in help_lines:

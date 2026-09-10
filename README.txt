@@ -1,4 +1,4 @@
-emirhankarakoc v1.4
+emirhankarakoc v1.6
 ===================
 
 CHAT PREFIX
@@ -6,7 +6,7 @@ CHAT PREFIX
 
 All proxy-generated in-game messages use:
 
-    [emirhankarakoc v1.4]
+    [emirhankarakoc v1.6]
 
 The old [V1.xx] prefix is gone.
 
@@ -51,7 +51,7 @@ MINIMUM TIME
 
 Any route shorter than:
 
-    11.000 seconds
+    8.000 seconds
 
 is rejected and never becomes replay data.
 
@@ -148,7 +148,7 @@ When ON:
        the learned route is armed
        if we are still alive it starts immediately in the SAME hand.
 
-Blacklisted winners and records shorter than 11 seconds are not used.
+Blacklisted winners and records shorter than 8 seconds are not used.
 
 
 TIME COMMANDS
@@ -321,3 +321,41 @@ When first route arrives:
 
     [AFKFARMING] FIRST ROUTE TRIGGER ... -> PLAY NOW
     [AFKFARMING] route activated ... started=True ...
+
+
+V1.5
+====
+
+Minimum record time:
+    8.000 seconds
+
+/timelist
+    Shows ALL saved map codes and their fastest usable BEST.
+
+Example:
+    @7288887 | 12.538s | Sstryss#0000 | P#211 | 43 pts
+    @7680000 | 14.921s | Pedro#4565 | P#8 | 63 pts
+
+/timelist @7680000
+    Shows only that map's BEST.
+
+Internally replay still matches:
+    mapCode + mirrored + mapHash
+
+
+V1.6
+====
+
+/timelist output cleaned up.
+
+Old:
+    @7680000 | 14.921s | Pedro#4565 | P#8 | 63 pts
+
+New:
+    @7680000 | 14.921s | Pedro#4565 | 63 pts
+
+Single map:
+
+    BEST @7680000 | 14.921s | Pedro#4565 | 63 pts
+
+Database row IDs are no longer shown in chat/terminal timelist output.

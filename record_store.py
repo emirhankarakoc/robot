@@ -10,7 +10,7 @@ class RecordStore:
 
     Rules:
       - lifecycle v3 only
-      - minimum replayable time: 11.000 seconds
+      - minimum replayable time: 8.000 seconds
       - one BEST record per exact map identity
       - SELF and learned PLAYER routes compete for that one BEST
       - blacklist is persistent
@@ -18,7 +18,7 @@ class RecordStore:
     """
 
     LIFE_TIMER_VERSION = 3
-    MIN_RECORD_SECONDS = 11.0
+    MIN_RECORD_SECONDS = 8.0
 
     def __init__(self, db_path="robot_records.db"):
         self.db_path = Path(db_path)
@@ -735,6 +735,92 @@ class RecordStore:
             )
         )
         return items[0]
+
+    def get_all_time_bests(self):
+        """
+        Return one fastest usable BEST row per mapCode.
+        Exact replay compatibility remains mapCode+mirrored+mapHash.
+        """
+        with self.lock:
+            own_rows = self.db.execute(
+                """
+                SELECT id, map_code, owner_name,
+                       finish_ms / 1000.0 AS seconds,
+                       event_count, payload_json
+                FROM records
+                WHERE life_timer_version=?
+                  AND finish_ms >= ?
+                  AND NOT EXISTS(
+                    SELECT 1 FROM blacklist b
+                    WHERE b.name_key=lower(records.owner_name)
+                  )
+                """,
+                (
+                    self.LIFE_TIMER_VERSION,
+                    self.MIN_RECORD_SECONDS * 1000.0,
+                ),
+            ).fetchall()
+
+            player_rows = self.db.execute(
+                """
+                SELECT id, map_code, target_name,
+                       victory_seconds AS seconds,
+                       event_count, payload_json
+                FROM player_records
+                WHERE end_reason='victory'
+                  AND life_timer_version=?
+                  AND victory_seconds >= ?
+                  AND NOT EXISTS(
+                    SELECT 1 FROM blacklist b
+                    WHERE b.name_key=lower(player_records.target_name)
+                  )
+                """,
+                (
+                    self.LIFE_TIMER_VERSION,
+                    self.MIN_RECORD_SECONDS,
+                ),
+            ).fetchall()
+
+        by_map = {}
+
+        def consider(item):
+            code = int(item["mapCode"])
+            cur = by_map.get(code)
+
+            if cur is None or float(item["seconds"]) < float(cur["seconds"]):
+                by_map[code] = item
+
+        for row in own_rows:
+            payload = json.loads(row["payload_json"])
+            consider(
+                {
+                    "source": "SELF",
+                    "id": int(row["id"]),
+                    "mapCode": int(row["map_code"]),
+                    "name": str(row["owner_name"] or "SELF"),
+                    "seconds": float(row["seconds"]),
+                    "points": int(row["event_count"]),
+                    "mirrored": bool(payload.get("mirrored", False)),
+                    "mapHash": payload.get("mapHash"),
+                }
+            )
+
+        for row in player_rows:
+            payload = json.loads(row["payload_json"])
+            consider(
+                {
+                    "source": "PLAYER",
+                    "id": int(row["id"]),
+                    "mapCode": int(row["map_code"]),
+                    "name": str(row["target_name"]),
+                    "seconds": float(row["seconds"]),
+                    "points": int(row["event_count"]),
+                    "mirrored": bool(payload.get("mirrored", False)),
+                    "mapHash": payload.get("mapHash"),
+                }
+            )
+
+        return [by_map[k] for k in sorted(by_map)]
 
     def set_best_owner(self, *, map_code, new_owner):
         new_owner = str(new_owner).strip()
