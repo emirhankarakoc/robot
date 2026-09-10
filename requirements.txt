@@ -1,0 +1,4 @@
+# Your existing Caseus environment already provides these.
+# Kept here so the V1 project documents its only external dependency.
+caseus
+pak
