@@ -6,15 +6,15 @@ from pathlib import Path
 
 class RecordStore:
     """
-    V1.8 SQLite store.
+    V1.9 SQLite store.
 
     Old pre-lifecycle-fix rows are preserved but NOT selected for autoplay.
 
     New rows use:
-        life_timer_version = 2
+        life_timer_version = 3
     """
 
-    LIFE_TIMER_VERSION = 2
+    LIFE_TIMER_VERSION = 3
 
     def __init__(
         self,
@@ -231,7 +231,7 @@ class RecordStore:
         if row is None:
             print(
                 f"[DB] MISS map={map_code} "
-                "(no clean lifecycle-v2 self record)"
+                "(no clean lifecycle-v3 self record)"
             )
             return None
 
@@ -381,7 +381,7 @@ class RecordStore:
         map_hash,
     ):
         """
-        ONLY successful lifecycle-v2 records are replayable.
+        ONLY successful lifecycle-v3 records are replayable.
         Failed/dead/round-change rows from old versions are ignored.
         """
         with self.lock:
@@ -417,7 +417,7 @@ class RecordStore:
                 f"[DB] PLAYER MISS "
                 f"target={target_name} "
                 f"map={map_code} "
-                "(no clean lifecycle-v2 victory)"
+                "(no clean lifecycle-v3 victory)"
             )
 
             return None
@@ -449,7 +449,7 @@ class RecordStore:
         map_hash,
     ):
         """
-        Fastest SUCCESSFUL lifecycle-v2 route from:
+        Fastest SUCCESSFUL lifecycle-v3 route from:
           1) self records
           2) learned remote winner records
         """

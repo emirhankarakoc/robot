@@ -19,7 +19,7 @@ from winner_recorder import WinnerRecorder
 
 class TfmProxy(Proxy):
     """
-    TFM V1.8
+    TFM V1.9
 
     ONLY:
         /record on
@@ -88,6 +88,12 @@ class TfmProxy(Proxy):
 
         self.self_alive = False
 
+        # Records/racing rooms can emit a fresh PlayerUpdate Alive on
+        # respawn without a preceding Dead. A short debounce prevents the
+        # normal player-list + player-update spawn pair from double-resetting.
+        self.last_self_alive_signal_ns = None
+        self.self_alive_signal_debounce_ns = 750_000_000  # 0.75 s
+
         # Captured from a real client->server connection.
         self.serverbound_source = None
 
@@ -95,7 +101,7 @@ class TfmProxy(Proxy):
         self.play_pending = False
 
         print(
-            "[PROXY] V1.8 listeners ready"
+            "[PROXY] V1.9 listeners ready"
         )
 
     # ==============================================================
@@ -204,9 +210,59 @@ class TfmProxy(Proxy):
         self,
         source_name,
     ):
-        # Duplicate Alive packets are common.
-        if self.self_alive:
+        observed_ns = time.perf_counter_ns()
+
+        already_alive = bool(
+            self.self_alive
+        )
+
+        last_signal = (
+            self.last_self_alive_signal_ns
+        )
+
+        separated = (
+            last_signal is None
+            or (
+                observed_ns
+                - int(last_signal)
+            )
+            >= self.self_alive_signal_debounce_ns
+        )
+
+        self.last_self_alive_signal_ns = (
+            observed_ns
+        )
+
+        # Same spawn can generate player-list and player-update Alive very
+        # close together. Ignore that pair.
+        #
+        # BUT: in records/racing/training a respawn can arrive as a NEW
+        # player-update Alive without a preceding Dead. If sufficiently
+        # separated, that Alive pulse is authoritative evidence of a new life.
+        respawn_pulse = (
+            already_alive
+            and source_name == "player-update"
+            and separated
+        )
+
+        if already_alive and not respawn_pulse:
             return
+
+        if respawn_pulse:
+            print(
+                "[LIFE] RESPAWN ALIVE pulse "
+                "without Dead -> FORCE RESET t=0"
+            )
+
+            if self.recorder.armed:
+                self.recorder.on_death(
+                    "respawn-alive-pulse"
+                )
+
+            if self.replayer.is_active():
+                self.replayer.stop(
+                    "respawn-alive-pulse"
+                )
 
         self.self_alive = True
 
@@ -214,28 +270,25 @@ class TfmProxy(Proxy):
             f"[LIFE] ALIVE "
             f"map={self.current_map} "
             f"round={self.current_round_id} "
-            f"source={source_name}"
+            f"source={source_name} "
+            f"respawnPulse={respawn_pulse}"
         )
 
-        # RECORD can stay enabled independently from PLAY.
-        #
-        # If PLAY has a route, live input will be blocked and there is
-        # nothing useful to record from the physical client.
-        #
-        # If PLAY has no route, Recorder is our autolearn attempt.
         if self.play_mode:
             if self.auto_record_fallback:
                 self.recorder.on_alive(
-                    time.perf_counter_ns(),
-                    source=source_name,
+                    observed_ns,
+                    source=(
+                        "respawn-alive-pulse"
+                        if respawn_pulse
+                        else source_name
+                    ),
                 )
             else:
                 self.play_pending = (
                     self.selected_route is not None
                 )
 
-                # Usually /play on or earlier packets already gave us a
-                # ClientConnection. Start at server Alive when possible.
                 if (
                     self.play_pending
                     and self.serverbound_source is not None
@@ -251,8 +304,12 @@ class TfmProxy(Proxy):
 
         elif self.record_mode:
             self.recorder.on_alive(
-                time.perf_counter_ns(),
-                source=source_name,
+                observed_ns,
+                source=(
+                    "respawn-alive-pulse"
+                    if respawn_pulse
+                    else source_name
+                ),
             )
 
     def _on_server_dead(
@@ -261,6 +318,7 @@ class TfmProxy(Proxy):
     ):
         was_alive = self.self_alive
         self.self_alive = False
+        self.last_self_alive_signal_ns = None
 
         print(
             f"[LIFE] DEAD -> RESET t=0 "
@@ -298,7 +356,7 @@ class TfmProxy(Proxy):
         try:
             await conn.write_packet(
                 clientbound.GeneralMessagePacket,
-                message=f"<J>[V1.8]</J> {message}",
+                message=f"<J>[V1.9]</J> {message}",
             )
         except Exception as exc:
             print(
@@ -374,10 +432,15 @@ class TfmProxy(Proxy):
         )
 
         if activity == "alive":
+            allow_respawn_pulse = (
+                source_name == "player-update"
+            )
+
             self.winner_recorder.on_alive(
                 session_id,
                 observed_ns=observed_ns,
                 source=source_name,
+                allow_respawn_pulse=allow_respawn_pulse,
             )
 
             if (
@@ -391,6 +454,7 @@ class TfmProxy(Proxy):
                 self.player_recorder.on_alive(
                     observed_ns,
                     source=source_name,
+                    allow_respawn_pulse=allow_respawn_pulse,
                 )
 
         elif activity == "dead":
@@ -546,6 +610,7 @@ class TfmProxy(Proxy):
 
         self.play_pending = False
         self.self_alive = False
+        self.last_self_alive_signal_ns = None
 
         self.current_map = int(
             packet.map_code
@@ -842,8 +907,8 @@ class TfmProxy(Proxy):
                 ),
 
                 (
-                    "LIFE TIMER | herhangi bir death=discard+reset; "
-                    "next Alive veya first movement=t0."
+                    "LIFE TIMER | death=discard+reset; ayrica records/racing "
+                    "respawn Alive pulse da yeni life=t0."
                 ),
 
                 (
@@ -853,7 +918,7 @@ class TfmProxy(Proxy):
 
             print()
             print("=" * 54)
-            print(" TFM V1.8 HELP")
+            print(" TFM V1.9 HELP")
             print("=" * 54)
 
             for line in help_lines:
@@ -1346,6 +1411,7 @@ class TfmProxy(Proxy):
         )
 
         self.self_alive = False
+        self.last_self_alive_signal_ns = None
 
         # Any real client death ends the current attempt.
         if self.recorder.armed:
@@ -1535,3 +1601,4 @@ class TfmProxy(Proxy):
             self.play_pending = False
 
         self.self_alive = False
+        self.last_self_alive_signal_ns = None

@@ -8,7 +8,7 @@ SATELLITE_PORT = 12801
 
 def main():
     print("=" * 42)
-    print(" TFM V1.8 - LIFECYCLE-SAFE RECORD / SERVER PLAY / AUTOLEARN")
+    print(" TFM V1.9 - RESPAWN-SAFE RECORD / SERVER PLAY / AUTOLEARN")
     print("=" * 42)
     print(f"[LISTEN] MAIN      {HOST}:{MAIN_PORT}")
     print(f"[LISTEN] SATELLITE {HOST}:{SATELLITE_PORT}")

@@ -4,7 +4,7 @@ import time
 
 class WinnerRecorder:
     """
-    V1.8 passive recorder for ALL remote players.
+    V1.9 passive recorder for ALL remote players.
 
     Critical rule:
         each session_id has an independent LIFE clock.
@@ -23,7 +23,7 @@ class WinnerRecorder:
         return ONLY the current life for saving
     """
 
-    LIFE_TIMER_VERSION = 2
+    LIFE_TIMER_VERSION = 3
 
     def __init__(self):
         self.enabled = False
@@ -38,8 +38,11 @@ class WinnerRecorder:
         self.facing_by_session = {}
         self.life_index_by_session = {}
 
+        self.last_alive_signal_by_session = {}
+        self.alive_signal_debounce_ns = 750_000_000  # 0.75 s
+
         print(
-            "[WINNER RECORDER] V1.8 lifecycle recorder ready"
+            "[WINNER RECORDER] V1.9 lifecycle recorder ready"
         )
 
     def set_enabled(self, enabled):
@@ -72,6 +75,7 @@ class WinnerRecorder:
         self.events_by_session = {}
         self.facing_by_session = {}
         self.life_index_by_session = {}
+        self.last_alive_signal_by_session = {}
 
         print(
             f"[WINNER RECORDER] NEW ROUND "
@@ -105,6 +109,7 @@ class WinnerRecorder:
         *,
         observed_ns=None,
         source="activity",
+        allow_respawn_pulse=False,
     ):
         if (
             not self.enabled
@@ -115,12 +120,15 @@ class WinnerRecorder:
         if observed_ns is None:
             observed_ns = time.perf_counter_ns()
 
+        observed_ns = int(
+            observed_ns
+        )
+
         session_id = int(
             session_id
         )
 
-        # Duplicate Alive must not restart a live timer.
-        if (
+        already_alive = (
             self.alive_by_session.get(
                 session_id,
                 False,
@@ -129,8 +137,48 @@ class WinnerRecorder:
                 session_id
             )
             is not None
-        ):
-            return False
+        )
+
+        last_signal = (
+            self.last_alive_signal_by_session.get(
+                session_id
+            )
+        )
+
+        separated = (
+            last_signal is None
+            or (
+                observed_ns
+                - int(last_signal)
+            )
+            >= self.alive_signal_debounce_ns
+        )
+
+        self.last_alive_signal_by_session[
+            session_id
+        ] = observed_ns
+
+        if already_alive:
+            if not (
+                allow_respawn_pulse
+                and separated
+            ):
+                return False
+
+            discarded = len(
+                self.events_by_session.get(
+                    session_id,
+                    [],
+                )
+            )
+
+            print(
+                f"[REMOTE LIFE] "
+                f"{self._name(session_id)} "
+                f"session={session_id} "
+                f"RESPAWN ALIVE pulse -> RESET "
+                f"discardedPoints={discarded}"
+            )
 
         life_index = (
             self.life_index_by_session.get(
@@ -150,9 +198,7 @@ class WinnerRecorder:
 
         self.anchor_by_session[
             session_id
-        ] = int(
-            observed_ns
-        )
+        ] = observed_ns
 
         self.events_by_session[
             session_id
@@ -220,6 +266,11 @@ class WinnerRecorder:
             session_id
         ] = True
 
+        self.last_alive_signal_by_session.pop(
+            session_id,
+            None,
+        )
+
         print(
             f"[REMOTE LIFE] "
             f"{self._name(session_id)} "
@@ -273,6 +324,7 @@ class WinnerRecorder:
                 session_id,
                 observed_ns=observed_ns,
                 source="movement-fallback",
+                allow_respawn_pulse=False,
             )
 
         anchor = self.anchor_by_session.get(
@@ -465,7 +517,7 @@ class WinnerRecorder:
         )
 
         record = {
-            "version": 2,
+            "version": 3,
 
             "lifeTimerVersion":
                 self.LIFE_TIMER_VERSION,

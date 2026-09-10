@@ -5,7 +5,7 @@ import time
 
 class Recorder:
     """
-    V1.8 SELF recorder.
+    V1.9 SELF recorder.
 
     The important rule is:
         EVERY LIFE HAS ITS OWN CLOCK.
@@ -26,8 +26,8 @@ class Recorder:
     It is measured locally from our own monotonic Alive -> Victory clock.
     """
 
-    VERSION = 2
-    LIFE_TIMER_VERSION = 2
+    VERSION = 3
+    LIFE_TIMER_VERSION = 3
 
     def __init__(self):
         self.lock = threading.RLock()
@@ -43,7 +43,7 @@ class Recorder:
         self.facing_right = True
 
         print(
-            "[RECORDER] V1.8 ready "
+            "[RECORDER] V1.9 ready "
             "(life timer resets on every death)"
         )
 

@@ -1,10 +1,10 @@
 @echo off
 cd /d "%~dp0"
 
-title TFM V1.8 - SIMPLE RECORD PLAY
+title TFM V1.9 - SIMPLE RECORD PLAY
 
 echo ==========================================
-echo  TFM V1.8 - LIFECYCLE-SAFE RECORD / SERVER PLAY / AUTOLEARN
+echo  TFM V1.9 - RESPAWN-SAFE RECORD / SERVER PLAY / AUTOLEARN
 echo ==========================================
 echo.
 echo Commands:

@@ -5,7 +5,7 @@ import time
 
 class PlayerRecorder:
     """
-    V1.8 passive recorder for one selected REMOTE player.
+    V1.9 passive recorder for one selected REMOTE player.
 
     Every life has its own clock.
 
@@ -21,7 +21,7 @@ class PlayerRecorder:
         only the current life is returned for saving
     """
 
-    LIFE_TIMER_VERSION = 2
+    LIFE_TIMER_VERSION = 3
 
     def __init__(self):
         self.lock = threading.RLock()
@@ -38,8 +38,14 @@ class PlayerRecorder:
 
         self.facing_right = True
 
+        # Some records/racing servers respawn a player with a new Alive
+        # update without first broadcasting Dead. We treat a sufficiently
+        # separated repeated player-update Alive as a new life.
+        self.last_alive_signal_ns = None
+        self.alive_signal_debounce_ns = 750_000_000  # 0.75 s
+
         print(
-            "[PLAYER RECORDER] V1.8 passive life recorder ready"
+            "[PLAYER RECORDER] V1.9 passive life recorder ready"
         )
 
     @property
@@ -70,6 +76,7 @@ class PlayerRecorder:
             self.events = []
             self.life_index = 0
             self.facing_right = True
+            self.last_alive_signal_ns = None
 
         print(
             f"[PLAYER RECORDER] target={nickname}"
@@ -87,6 +94,7 @@ class PlayerRecorder:
             self.anchor_ns = None
             self.events = []
             self.facing_right = True
+            self.last_alive_signal_ns = None
 
         if old:
             print(
@@ -140,6 +148,7 @@ class PlayerRecorder:
             self.events = []
             self.life_index = 0
             self.facing_right = True
+            self.last_alive_signal_ns = None
 
         print(
             f"[PLAYER RECORDER] map armed "
@@ -151,9 +160,14 @@ class PlayerRecorder:
         self,
         observed_ns=None,
         source="activity",
+        allow_respawn_pulse=False,
     ):
         if observed_ns is None:
             observed_ns = time.perf_counter_ns()
+
+        observed_ns = int(
+            observed_ns
+        )
 
         with self.lock:
             if (
@@ -163,14 +177,51 @@ class PlayerRecorder:
             ):
                 return False
 
-            if (
+            already_alive = (
                 self.alive
                 and self.anchor_ns is not None
-            ):
-                return False
+            )
+
+            last_signal = (
+                self.last_alive_signal_ns
+            )
+
+            separated = (
+                last_signal is None
+                or (
+                    observed_ns
+                    - int(last_signal)
+                )
+                >= self.alive_signal_debounce_ns
+            )
+
+            # Always remember the newest Alive signal.
+            self.last_alive_signal_ns = (
+                observed_ns
+            )
+
+            # Same spawn often produces player-list + player-update Alive
+            # close together. Ignore those.
+            if already_alive:
+                if not (
+                    allow_respawn_pulse
+                    and separated
+                ):
+                    return False
+
+                discarded = len(
+                    self.events
+                )
+
+                print(
+                    f"[PLAYER LIFE] "
+                    f"{self.target_name} "
+                    f"RESPAWN ALIVE pulse -> RESET "
+                    f"discardedPoints={discarded}"
+                )
 
             self.alive = True
-            self.anchor_ns = int(
+            self.anchor_ns = (
                 observed_ns
             )
 
@@ -243,6 +294,7 @@ class PlayerRecorder:
             self.on_alive(
                 observed_ns,
                 source="movement-fallback",
+                allow_respawn_pulse=False,
             )
 
         with self.lock:
@@ -409,7 +461,7 @@ class PlayerRecorder:
             )
 
             record = {
-                "version": 2,
+                "version": 3,
                 "lifeTimerVersion":
                     self.LIFE_TIMER_VERSION,
 

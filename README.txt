@@ -1,131 +1,102 @@
-TFM V1.8 - LIFECYCLE SAFE
-===========================
+TFM V1.9 - RESPAWN-SAFE LIFE TIMER
+==================================
 
-MAIN FIX
+WHY V1.8 COULD STILL FAIL
+-------------------------
+
+Some records/racing/training room implementations can respawn a player by
+sending a fresh PlayerUpdate activity=Alive WITHOUT first sending activity=Dead.
+
+V1.8 ignored Alive while it already believed the player was alive.
+
+Result:
+    failed attempt + next attempt could share one timer.
+
+Example symptom:
+    game completion ~16.75s
+    recorder life ~41s
+
+
+V1.9 RULE
+---------
+
+A repeated:
+
+    player-update -> activity=Alive
+
+is treated as a NEW LIFE when it is separated from the previous Alive signal
+by at least 0.75 seconds.
+
+Normal same-spawn duplicate signals that arrive close together are ignored.
+
+So:
+
+    Alive
+      -> t0
+
+    ... player plays ...
+
+    death packet received
+      -> discard + reset
+
+OR, if Dead packet is missing:
+
+    later PlayerUpdate Alive
+      -> RESPAWN ALIVE PULSE
+      -> discard old attempt
+      -> new t0
+
+
+SELF LOG
 --------
 
-Every player now has a LIFE clock, not only a round clock.
+When the missing-Dead case happens:
 
-For SELF and every observed REMOTE player:
-
-    DEAD
-        -> current attempt discarded
-        -> anchor cleared
-        -> events cleared
-        -> timer reset
-
-    ALIVE
-        -> new life
-        -> t = 0
-
-    first movement without Alive packet
-        -> movement-fallback Alive
-        -> t = 0
-
-This is specifically meant to work in training / records / racing-style
-rooms where a player can die and respawn multiple times inside one NewRound.
+    [LIFE] RESPAWN ALIVE pulse without Dead -> FORCE RESET t=0
+    [RECORD LIFE] DEAD -> RESET t=0 source=respawn-alive-pulse ...
+    [RECORD LIFE] ALIVE -> t=0 life=... source=respawn-alive-pulse
 
 
-SUCCESS TIME
-------------
+REMOTE LOG
+----------
 
-Old versions trusted:
+Same logic exists independently for every observed remote player:
 
-    PlayerVictoryPacket.seconds
-
-for DB ranking.
-
-V1.8 does NOT trust that as the primary timer.
-
-V1.8 measures:
-
-    local monotonic Alive -> Victory duration
-
-and saves that as:
-
-    finishMs            for self records
-    victorySeconds      for remote winner records
-
-The server's packet.seconds is retained only as:
-
-    reportedVictorySeconds
-
-for debugging.
-
-
-FAILED ATTEMPTS
----------------
-
-Failed/dead remote lives are NOT replay data.
-
-They are discarded.
-
-Round-change, target-change and manual stop do not create a replayable
-remote route.
-
-Only:
-
-    reason = victory
-
-is stored as a clean remote route.
-
-
-OLD DATABASE ROWS
------------------
-
-Old rows are preserved.
-
-V1.8 adds:
-
-    life_timer_version = 2
-
-to both tables.
-
-Autoplay selects ONLY lifecycle-v2 rows.
-
-This prevents old records with non-reset timers from contaminating
-records/training data.
-
-
-EXPECTED SELF LOG
------------------
-
-Death:
-
-    [DEATH] CLIENT -> SERVER | RESET SELF LIFE TIMER
-    [RECORD LIFE] DEAD -> RESET t=0 ...
-
-Respawn:
-
-    [LIFE] ALIVE ...
-    [RECORD LIFE] ALIVE -> t=0 life=...
-
-If Alive packet is absent:
-
-    [LIFE] SELF movement-fallback ALIVE -> t=0
-    [RECORD LIFE] ALIVE -> t=0 ... source=movement-fallback
-
-
-EXPECTED REMOTE LOG
--------------------
-
-    [REMOTE LIFE] Pedro#4565 ... ALIVE -> t=0 life=...
-    ...
-    [REMOTE LIFE] Pedro#4565 ... DEAD -> RESET t=0 ...
-    ...
+    [REMOTE LIFE] Pedro#4565 ... RESPAWN ALIVE pulse -> RESET ...
     [REMOTE LIFE] Pedro#4565 ... ALIVE -> t=0 life=...
 
 
-WINNER
-------
+CHEESE TIMER VS COMPLETION TIMER
+--------------------------------
 
-The first finisher is still learned.
+"You got the cheese in 7.808 seconds"
 
-But only the winner's CURRENT life is saved.
+is NOT the final records completion time.
 
-If the winner died three times before the successful attempt, those three
-failed trajectories are already discarded and do not exist inside the saved
-winner route.
+If the game says:
+
+    You completed map ... in 17.48 seconds
+
+then a recorder result around:
+
+    17.48s life
+
+is correct.
+
+V1.9 does NOT reset the life clock merely because cheese was collected.
+
+
+DATABASE
+--------
+
+V1.9 uses:
+
+    life_timer_version = 3
+
+V1.8 and older rows remain in robot_records.db but are ignored by autoplay.
+
+This avoids selecting a V1.8 row whose timer accidentally included multiple
+lives.
 
 
 COMMANDS
@@ -144,10 +115,3 @@ COMMANDS
 
 /playplayer Nick#0000
 /playplayer off
-
-
-PORTS
------
-
-MAIN       11801
-SATELLITE  12801
