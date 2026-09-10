@@ -1,4 +1,4 @@
-emirhankarakoc v1.2
+emirhankarakoc v1.4
 ===================
 
 CHAT PREFIX
@@ -6,7 +6,7 @@ CHAT PREFIX
 
 All proxy-generated in-game messages use:
 
-    [emirhankarakoc v1.2]
+    [emirhankarakoc v1.4]
 
 The old [V1.xx] prefix is gone.
 
@@ -217,3 +217,107 @@ Expected terminal diagnostics:
 
 Replay terminal grace:
     6 repeats x 40ms
+
+
+V1.3 FIXES
+==========
+
+AFKFARMING:
+    - exactly TWO jumps per life
+    - jump #1 at life +5.00s
+    - jump #2 at life +5.75s
+    - sequence cannot re-arm itself after it finishes
+    - synthetic jump/release is mirrored to local client, so it is visible
+
+FINISH / HOLE:
+    Remote winner movement broadcasts can end beside the hole and then the
+    next packet is PlayerVictoryPacket. Repeating that final x/y freezes the
+    replay next to the hole.
+
+    V1.3 replaces frozen terminal spam with FINISH DRIVE:
+
+      - infer LEFT/RIGHT from final held movement
+      - infer recent horizontal speed
+      - after nominal route end, send dense 40ms movement checkpoints
+      - advance x continuously in final direction
+      - mirror the same checkpoints to local client
+      - maximum 1.00s
+      - server PlayerVictoryPacket immediately stops the replay
+
+Expected terminal:
+    [FINISH DRIVE] direction=RIGHT speed=...
+    [TX->SERVER] ... reason=finish-drive-1 ...
+    [TX->CLIENT] ...
+    [PLAY] STOP reason=server-victory
+
+
+V1.4 FIXES
+==========
+
+AFK JUMP
+--------
+Exactly ONE jump per life:
+
+    life +5.00s -> jump
+    +0.10s      -> release
+    DONE
+
+The jump cannot schedule again during the same life.
+
+
+FIRST RUN -> INSTANT PLAY
+-------------------------
+V1.3 used afk_jump_pending for two different jobs:
+
+    1) should the AFK jump still run?
+    2) are we waiting for the first learned route?
+
+After the jump finished, afk_jump_pending became False.
+Therefore a winner arriving later was saved but NOT replayed immediately.
+
+V1.4 separates those states:
+
+    afk_jump_pending
+        only controls the one 5-second jump
+
+    afk_waiting_for_route
+        remains True for the entire recordless round
+        until an eligible winner is saved
+
+Flow:
+
+    round starts
+    no route
+    afk_waiting_for_route=True
+
+    5.00s
+    one jump
+    jumpPending=False
+    waitingForRoute STILL True
+
+    first eligible winner
+    record saved
+    [AFKFARMING] FIRST ROUTE TRIGGER ... -> PLAY NOW
+    play_mode=True
+    route armed
+    if self is alive + server connection exists:
+        replay starts immediately in the SAME round
+
+    route activation
+    afk_waiting_for_route=False
+
+
+DIAGNOSTIC LOGS
+----------------
+At round start:
+
+    [AFKFARMING STATE] ... waitingForRoute=True jumpPending=True
+
+After one jump:
+
+    [AFKFARMING] jump DONE ... count=1 | still waiting for first eligible route
+
+When first route arrives:
+
+    [AFKFARMING] FIRST ROUTE TRIGGER ... -> PLAY NOW
+    [AFKFARMING] route activated ... started=True ...

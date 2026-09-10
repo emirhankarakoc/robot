@@ -8,7 +8,7 @@ SATELLITE_PORT = 12801
 
 def main():
     print("=" * 62)
-    print(" emirhankarakoc v1.2 - RECORD / RACING / AUTOLEARN")
+    print(" emirhankarakoc v1.4 - RECORD / RACING / AUTOLEARN")
     print("=" * 62)
     print(f"[LISTEN] MAIN      {HOST}:{MAIN_PORT}")
     print(f"[LISTEN] SATELLITE {HOST}:{SATELLITE_PORT}")

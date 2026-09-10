@@ -1,10 +1,10 @@
 @echo off
 cd /d "%~dp0"
 
-title emirhankarakoc v1.2
+title emirhankarakoc v1.4
 
 echo ==============================================================
-echo  emirhankarakoc v1.2 - RECORD / RACING / AUTOLEARN
+echo  emirhankarakoc v1.4 - RECORD / RACING / AUTOLEARN
 echo ==============================================================
 echo.
 echo Commands:

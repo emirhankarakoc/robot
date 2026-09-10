@@ -20,7 +20,7 @@ from winner_recorder import WinnerRecorder
 
 class TfmProxy(Proxy):
     """
-    TFM emirhankarakoc v1.2
+    TFM emirhankarakoc v1.4
 
     ONLY:
         /record on
@@ -79,6 +79,13 @@ class TfmProxy(Proxy):
         self.afk_jump_pending = False
         self.afk_jump_task = None
         self.afk_life_start_ns = None
+        self.afk_jumps_done_for_life = False
+
+        # Separate from jump state:
+        # True means THIS ROUND started with no route and AFKFARMING is
+        # waiting for the first eligible learned winner so it can replay
+        # immediately in the same round.
+        self.afk_waiting_for_route = False
 
         self.self_victory_capture_pending = False
         self.self_victory_capture_task = None
@@ -114,7 +121,7 @@ class TfmProxy(Proxy):
         self.play_pending = False
 
         print(
-            "[PROXY] emirhankarakoc v1.2 listeners ready"
+            "[PROXY] emirhankarakoc v1.4 listeners ready"
         )
 
     # ==============================================================
@@ -217,102 +224,135 @@ class TfmProxy(Proxy):
         life_start_ns,
     ):
         try:
-            # First jump at life+5.00s, second at life+5.75s.
-            for jump_number, target_offset_seconds in (
-                (1, 5.00),
-                (2, 5.75),
-            ):
-                elapsed = max(
-                    0.0,
-                    (
-                        time.perf_counter_ns()
-                        - int(life_start_ns)
-                    )
-                    / 1_000_000_000.0,
-                )
+            # ONE jump only, exactly life +5.00s.
+            target_offset_seconds = 5.00
 
-                delay = max(
-                    0.0,
-                    target_offset_seconds - elapsed,
-                )
-
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-                if (
-                    not self.afk_farming
-                    or not self.afk_jump_pending
-                    or self.current_round_id != round_id
-                    or self.selected_route is not None
-                ):
-                    return
-
-                jump_event = dict(base_event)
-                jump_event["jumping"] = True
-                jump_event["velocityY"] = -50.0
-                jump_event["jumpingFrameIndex"] = int(
-                    jump_event.get("jumpingFrameIndex", 0)
-                ) + jump_number
-
-                packet = self.replayer._build_packet(
-                    jump_event,
-                    round_id,
-                )
-
-                actual_elapsed = (
+            elapsed = max(
+                0.0,
+                (
                     time.perf_counter_ns()
                     - int(life_start_ns)
-                ) / 1_000_000_000.0
+                )
+                / 1_000_000_000.0,
+            )
 
+            delay = max(
+                0.0,
+                target_offset_seconds - elapsed,
+            )
+
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            if (
+                not self.afk_farming
+                or not self.afk_jump_pending
+                or self.current_round_id != round_id
+                or self.selected_route is not None
+            ):
+                return
+
+            jump_event = dict(base_event)
+            jump_event["jumping"] = True
+            jump_event["velocityY"] = -50.0
+            jump_event["jumpingFrameIndex"] = int(
+                jump_event.get("jumpingFrameIndex", 0)
+            ) + 1
+
+            packet = self.replayer._build_packet(
+                jump_event,
+                round_id,
+            )
+
+            actual_elapsed = (
+                time.perf_counter_ns()
+                - int(life_start_ns)
+            ) / 1_000_000_000.0
+
+            print(
+                "[TX->SERVER] "
+                f"packet={type(packet).__name__} "
+                "reason=afkfarming-jump-1 "
+                f"lifeT={actual_elapsed:.3f}s "
+                f"map=@{self.current_map} "
+                f"round={round_id} "
+                f"x={jump_event['x']:.2f} "
+                f"y={jump_event['y']:.2f} "
+                f"vy={jump_event['velocityY']:.2f} "
+                "jump=True"
+            )
+
+            await (
+                source_conn.destination
+                .write_packet_instance(packet)
+            )
+
+            try:
+                await self.replayer._mirror_to_local_client(
+                    source_conn,
+                    jump_event,
+                    self.self_session_id,
+                )
+            except Exception as exc:
                 print(
-                    "[TX->SERVER] "
-                    f"packet={type(packet).__name__} "
-                    f"reason=afkfarming-jump-{jump_number} "
-                    f"lifeT={actual_elapsed:.3f}s "
-                    f"map=@{self.current_map} "
-                    f"round={round_id} "
-                    f"x={jump_event['x']:.2f} "
-                    f"y={jump_event['y']:.2f} "
-                    f"vy={jump_event['velocityY']:.2f} "
-                    "jump=True"
+                    "[AFKFARMING LOCAL ERROR] "
+                    f"{type(exc).__name__}: {exc}"
                 )
 
-                await (
-                    source_conn.destination
-                    .write_packet_instance(packet)
-                )
+            await asyncio.sleep(0.10)
 
-                await asyncio.sleep(0.10)
+            if (
+                not self.afk_farming
+                or self.current_round_id != round_id
+                or self.selected_route is not None
+            ):
+                return
 
-                if (
-                    not self.afk_farming
-                    or self.current_round_id != round_id
-                    or self.selected_route is not None
-                ):
-                    return
+            release_event = dict(base_event)
+            release_event["jumping"] = False
+            release_event["velocityY"] = 0.0
 
-                release_event = dict(base_event)
-                release_event["jumping"] = False
-                release_event["velocityY"] = 0.0
+            release_packet = self.replayer._build_packet(
+                release_event,
+                round_id,
+            )
 
-                release_packet = self.replayer._build_packet(
+            print(
+                "[TX->SERVER] "
+                f"packet={type(release_packet).__name__} "
+                "reason=afkfarming-jump-1-release "
+                f"map=@{self.current_map} "
+                f"round={round_id} "
+                "jump=False"
+            )
+
+            await (
+                source_conn.destination
+                .write_packet_instance(release_packet)
+            )
+
+            try:
+                await self.replayer._mirror_to_local_client(
+                    source_conn,
                     release_event,
-                    round_id,
+                    self.self_session_id,
                 )
-
+            except Exception as exc:
                 print(
-                    "[TX->SERVER] "
-                    f"packet={type(release_packet).__name__} "
-                    f"reason=afkfarming-jump-{jump_number}-release "
-                    f"map=@{self.current_map} "
-                    f"round={round_id} "
-                    "jump=False"
+                    "[AFKFARMING LOCAL ERROR] "
+                    f"{type(exc).__name__}: {exc}"
                 )
 
-                await (
-                    source_conn.destination
-                    .write_packet_instance(release_packet)
-                )
+            # Jump is done, but IMPORTANT:
+            # afk_waiting_for_route remains True.
+            self.afk_jumps_done_for_life = True
+            self.afk_jump_pending = False
+
+            print(
+                f"[AFKFARMING] jump DONE "
+                f"map=@{self.current_map} "
+                "count=1 | still waiting for first eligible route"
+            )
 
         except asyncio.CancelledError:
             return
@@ -332,6 +372,7 @@ class TfmProxy(Proxy):
             or not self.afk_jump_pending
             or self.selected_route is not None
             or self.afk_jump_task is not None
+            or self.afk_jumps_done_for_life
             or source_conn is None
             or source_conn.destination is None
             or self.current_round_id is None
@@ -360,7 +401,7 @@ class TfmProxy(Proxy):
         print(
             f"[AFKFARMING] no route map=@{self.current_map} "
             f"lifeT={elapsed:.3f}s "
-            "-> jumps scheduled for 5.00s / 5.75s"
+            "-> one jump scheduled for 5.00s"
         )
 
     async def _activate_learned_route_now(self, route):
@@ -369,6 +410,8 @@ class TfmProxy(Proxy):
 
         owner = self._route_owner(route)
         seconds = self._route_seconds(route)
+
+        self.afk_waiting_for_route = False
 
         self._cancel_afk_jump_task(
             "winner-route-ready"
@@ -416,7 +459,10 @@ class TfmProxy(Proxy):
             f"map=@{self.current_map} "
             f"owner={owner} "
             f"time={seconds:.3f}s "
-            f"started={started}"
+            f"started={started} "
+            f"playMode={self.play_mode} "
+            f"playPending={self.play_pending} "
+            f"waitingForRoute={self.afk_waiting_for_route}"
         )
 
         return started
@@ -570,6 +616,7 @@ class TfmProxy(Proxy):
 
         self.self_alive = True
         self.afk_life_start_ns = int(observed_ns)
+        self.afk_jumps_done_for_life = False
 
         print(
             f"[LIFE] ALIVE "
@@ -625,6 +672,7 @@ class TfmProxy(Proxy):
         self.self_alive = False
         self.last_self_alive_signal_ns = None
         self.afk_life_start_ns = None
+        self.afk_jumps_done_for_life = False
 
         print(
             f"[LIFE] DEAD -> RESET t=0 "
@@ -669,7 +717,7 @@ class TfmProxy(Proxy):
         try:
             await conn.write_packet(
                 clientbound.GeneralMessagePacket,
-                message=f"<J>[emirhankarakoc v1.2]</J> {message}",
+                message=f"<J>[emirhankarakoc v1.4]</J> {message}",
             )
         except Exception as exc:
             print(
@@ -938,6 +986,7 @@ class TfmProxy(Proxy):
         self.self_alive = False
         self.last_self_alive_signal_ns = None
         self.afk_life_start_ns = None
+        self.afk_jumps_done_for_life = False
 
         self.current_map = int(
             packet.map_code
@@ -1004,6 +1053,7 @@ class TfmProxy(Proxy):
         self.selected_route = None
         self.auto_record_fallback = False
         self.play_pending = False
+        self.afk_waiting_for_route = False
 
         # ALWAYS show the currently usable record at hand start.
         round_best = self.store.get_best_any_route(
@@ -1042,9 +1092,20 @@ class TfmProxy(Proxy):
         if self.afk_farming and round_best is not None:
             self.play_mode = True
 
-        self.afk_jump_pending = (
+        self.afk_waiting_for_route = (
             self.afk_farming
             and round_best is None
+        )
+
+        self.afk_jump_pending = (
+            self.afk_waiting_for_route
+        )
+
+        print(
+            f"[AFKFARMING STATE] "
+            f"map=@{self.current_map} "
+            f"waitingForRoute={self.afk_waiting_for_route} "
+            f"jumpPending={self.afk_jump_pending}"
         )
 
         if self.play_mode:
@@ -1056,7 +1117,7 @@ class TfmProxy(Proxy):
         if self.afk_farming and round_best is None:
             await self._chat(
                 f"AFKFARMING @{self.current_map} | "
-                "no run: 2 jumps armed; first eligible winner -> instant replay"
+                "no run: 1 jump at 5.00s; first eligible winner -> instant replay"
             )
 
     # ==============================================================
@@ -1229,6 +1290,9 @@ class TfmProxy(Proxy):
                     )
 
                 if route is not None:
+                    self.afk_waiting_for_route = False
+                    self.afk_jump_pending = False
+
                     self.play_mode = True
                     self.selected_route = None
                     self._load_play_for_current_map()
@@ -1239,10 +1303,11 @@ class TfmProxy(Proxy):
                         source,
                     )
                 else:
-                    self.afk_jump_pending = self._map_context_ready()
+                    self.afk_waiting_for_route = self._map_context_ready()
+                    self.afk_jump_pending = self.afk_waiting_for_route
 
                     await self._chat(
-                        "AFKFARMING ON | no run => 2 jumps, "
+                        "AFKFARMING ON | no run => 1 jump at 5s, "
                         "then first eligible winner is replayed immediately",
                         source,
                     )
@@ -1252,6 +1317,7 @@ class TfmProxy(Proxy):
 
             if argument in ("off", "stop"):
                 self.afk_farming = False
+                self.afk_waiting_for_route = False
                 self._cancel_afk_jump_task("afkfarming-off")
 
                 self.winner_recorder.set_enabled(
@@ -1672,7 +1738,7 @@ class TfmProxy(Proxy):
                 ),
 
                 (
-                    "/afkfarming on/off | run yoksa 2 jump; "
+                    "/afkfarming on/off | run yoksa 1 jump at 5s; "
                     "ilk uygun winner gelince aninda replay."
                 ),
 
@@ -1701,7 +1767,7 @@ class TfmProxy(Proxy):
 
             print()
             print("=" * 54)
-            print(" TFM emirhankarakoc v1.2 HELP")
+            print(" TFM emirhankarakoc v1.4 HELP")
             print("=" * 54)
 
             for line in help_lines:
@@ -2118,6 +2184,8 @@ class TfmProxy(Proxy):
             if self.afk_life_start_ns is None:
                 self.afk_life_start_ns = int(observed_ns)
 
+            self.afk_jumps_done_for_life = False
+
             print(
                 "[LIFE] SELF movement-fallback "
                 "ALIVE -> t=0"
@@ -2484,9 +2552,17 @@ class TfmProxy(Proxy):
                         # winner trajectory in the SAME hand.
                         if (
                             self.afk_farming
-                            and self.afk_jump_pending
+                            and self.afk_waiting_for_route
                             and record_id is not None
                         ):
+                            print(
+                                f"[AFKFARMING] FIRST ROUTE TRIGGER "
+                                f"map=@{self.current_map} "
+                                f"owner={winner_record['targetName']} "
+                                f"time={learned_seconds:.3f}s "
+                                "-> PLAY NOW"
+                            )
+
                             winner_record["id"] = record_id
 
                             await self._activate_learned_route_now(

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import os
 import ctypes
 
@@ -12,7 +13,7 @@ from caseus.packets.common import (
 
 class Replayer:
     """
-    emirhankarakoc v1.2 replay.
+    emirhankarakoc v1.4 replay.
 
     Sends ONLY saved PlayerMovementPacket states to the backend,
     at the SAME recorded timestamps.
@@ -37,7 +38,7 @@ class Replayer:
                 pass
 
         print(
-            "[PLAYER] emirhankarakoc v1.2 ready "
+            "[PLAYER] emirhankarakoc v1.4 ready "
             "(recorded coordinates -> backend + local mirror)"
         )
 
@@ -231,6 +232,306 @@ class Replayer:
             f"R={bool(event.get('movingRight', False))} "
             f"jump={bool(event.get('jumping', False))} "
             f"terminalHold={bool(event.get('terminalHold', False))}"
+        )
+
+    @staticmethod
+    def _infer_finish_direction(events):
+        """
+        Prefer the final held LEFT/RIGHT state.
+        If neither is held, infer horizontal direction from recent x change.
+        """
+        if not events:
+            return 0
+
+        last = events[-1]
+
+        right = bool(
+            last.get("movingRight", False)
+        )
+        left = bool(
+            last.get("movingLeft", False)
+        )
+
+        if right and not left:
+            return 1
+
+        if left and not right:
+            return -1
+
+        # Find the latest pair with a meaningful horizontal displacement.
+        for i in range(len(events) - 1, 0, -1):
+            x2 = float(events[i].get("x", 0.0))
+            x1 = float(events[i - 1].get("x", 0.0))
+            dx = x2 - x1
+
+            if abs(dx) >= 0.75:
+                return 1 if dx > 0 else -1
+
+        # Last fallback: facing.
+        return 1 if bool(last.get("facingRight", True)) else -1
+
+    @staticmethod
+    def _infer_finish_speed(events, direction):
+        """
+        Estimate pixels/second from the last ~1.5s of useful movement.
+
+        We intentionally use a conservative minimum so a route whose final
+        broadcast stalls beside the hole can still cross into it.
+        """
+        if not events or direction == 0:
+            return 0.0
+
+        end_us = int(
+            events[-1].get("tUs", 0)
+        )
+
+        samples = []
+
+        start_index = max(
+            1,
+            len(events) - 14,
+        )
+
+        for i in range(start_index, len(events)):
+            a = events[i - 1]
+            b = events[i]
+
+            ta = int(a.get("tUs", 0))
+            tb = int(b.get("tUs", 0))
+
+            if tb <= ta:
+                continue
+
+            if end_us - tb > 1_500_000:
+                continue
+
+            dt = (
+                tb - ta
+            ) / 1_000_000.0
+
+            # Ignore sub-20ms packet bursts; they wildly exaggerate dx/dt.
+            if dt < 0.020 or dt > 0.600:
+                continue
+
+            dx = float(b.get("x", 0.0)) - float(a.get("x", 0.0))
+
+            if abs(dx) < 0.50:
+                continue
+
+            if (dx > 0) != (direction > 0):
+                continue
+
+            samples.append(
+                abs(dx) / dt
+            )
+
+        if samples:
+            speed = float(
+                statistics.median(samples)
+            )
+        else:
+            speed = 0.0
+
+        # 35 px/s gives ~1.4 px per 40 ms packet.
+        # 90 px/s upper bound keeps finish-drive controlled.
+        return max(
+            35.0,
+            min(
+                speed,
+                90.0,
+            ),
+        )
+
+    @staticmethod
+    def _infer_packet_velocity_x(events, direction):
+        if not events or direction == 0:
+            return 0.0
+
+        values = []
+
+        for event in reversed(events[-14:]):
+            vx = float(
+                event.get(
+                    "velocityX",
+                    0.0,
+                )
+            )
+
+            if abs(vx) < 3.0:
+                continue
+
+            if (vx > 0) != (direction > 0):
+                continue
+
+            values.append(
+                abs(vx)
+            )
+
+            if len(values) >= 5:
+                break
+
+        if values:
+            magnitude = float(
+                statistics.median(values)
+            )
+        else:
+            magnitude = 34.5
+
+        magnitude = max(
+            20.0,
+            min(
+                magnitude,
+                120.0,
+            ),
+        )
+
+        return magnitude * direction
+
+    async def _finish_drive(
+        self,
+        *,
+        events,
+        generation,
+        round_id,
+        source_conn,
+        self_session_id,
+    ):
+        """
+        Remote winner broadcasts can stop a few pixels BEFORE the hole,
+        because the next server event is victory rather than another movement
+        broadcast.
+
+        Do not freeze the last coordinate. Continue the final input direction
+        in dense 40ms steps for at most 1 second. on_player_victory() calls
+        stop(), so this exits immediately once the owned backend recognizes
+        the hole.
+        """
+        if not events:
+            return
+
+        terminal = copy.deepcopy(
+            events[-1]
+        )
+
+        direction = self._infer_finish_direction(
+            events
+        )
+
+        speed_px_s = self._infer_finish_speed(
+            events,
+            direction,
+        )
+
+        packet_vx = self._infer_packet_velocity_x(
+            events,
+            direction,
+        )
+
+        print(
+            "[FINISH DRIVE] "
+            f"direction={'RIGHT' if direction > 0 else 'LEFT' if direction < 0 else 'NONE'} "
+            f"speed={speed_px_s:.2f}px/s "
+            f"packetVx={packet_vx:.2f} "
+            f"start=({float(terminal.get('x', 0.0)):.2f},"
+            f"{float(terminal.get('y', 0.0)):.2f})"
+        )
+
+        if direction == 0:
+            return
+
+        base_x = float(
+            terminal.get(
+                "x",
+                0.0,
+            )
+        )
+
+        # Dense crossing packets. 25 * 40 ms = 1.0 second maximum.
+        for step in range(1, 26):
+            await asyncio.sleep(
+                0.040
+            )
+
+            if (
+                not self.active
+                or generation != self.generation
+            ):
+                return
+
+            elapsed = step * 0.040
+
+            drive_event = copy.deepcopy(
+                terminal
+            )
+
+            drive_event["x"] = (
+                base_x
+                + direction
+                * speed_px_s
+                * elapsed
+            )
+
+            drive_event["velocityX"] = (
+                packet_vx
+            )
+
+            drive_event["movingRight"] = (
+                direction > 0
+            )
+
+            drive_event["movingLeft"] = (
+                direction < 0
+            )
+
+            drive_event["facingRight"] = (
+                direction > 0
+            )
+
+            # Preserve vertical state, but don't invent another jump.
+            drive_event["jumping"] = bool(
+                terminal.get(
+                    "jumping",
+                    False,
+                )
+            )
+
+            drive_event["finishDrive"] = True
+            drive_event["finishDriveStep"] = step
+
+            packet = self._build_packet(
+                drive_event,
+                round_id,
+            )
+
+            self._log_server_packet(
+                packet,
+                drive_event,
+                reason=f"finish-drive-{step}",
+            )
+
+            await (
+                source_conn
+                .destination
+                .write_packet_instance(
+                    packet
+                )
+            )
+
+            try:
+                await self._mirror_to_local_client(
+                    source_conn,
+                    drive_event,
+                    self_session_id,
+                )
+            except Exception as exc:
+                print(
+                    "[FINISH DRIVE LOCAL ERROR] "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        print(
+            "[FINISH DRIVE] maximum 1.00s reached "
+            "without victory packet"
         )
 
     async def _mirror_to_local_client(
@@ -436,9 +737,6 @@ class Replayer:
                     f"{'R' if event.get('facingRight', True) else 'L'}"
                 )
 
-            # Victory can occur while the final movement key is still held.
-            # Repeat the terminal state briefly so a sparse trajectory does
-            # not stop one packet before the server recognizes the hole.
             events = self.record.get(
                 "events",
                 [],
@@ -448,35 +746,13 @@ class Replayer:
                 events
                 and bool(events[-1].get("terminalHold", False))
             ):
-                terminal_event = events[-1]
-
-                for repeat_index in range(6):
-                    await asyncio.sleep(0.04)
-
-                    if (
-                        not self.active
-                        or generation != self.generation
-                    ):
-                        return
-
-                    packet = self._build_packet(
-                        terminal_event,
-                        round_id,
-                    )
-
-                    self._log_server_packet(
-                        packet,
-                        terminal_event,
-                        reason=f"terminal-grace-{repeat_index + 1}",
-                    )
-
-                    await (
-                        source_conn
-                        .destination
-                        .write_packet_instance(
-                            packet
-                        )
-                    )
+                await self._finish_drive(
+                    events=events,
+                    generation=generation,
+                    round_id=round_id,
+                    source_conn=source_conn,
+                    self_session_id=self_session_id,
+                )
 
             print(
                 "[PLAY] trajectory complete; "
