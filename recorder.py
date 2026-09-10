@@ -5,24 +5,29 @@ import time
 
 class Recorder:
     """
-    V1 recorder.
+    V1.8 SELF recorder.
 
-    Saves the CLIENT'S REAL outgoing PlayerMovementPacket states.
+    The important rule is:
+        EVERY LIFE HAS ITS OWN CLOCK.
 
-    Per checkpoint:
-      - tUs
-      - x / y
-      - vx / vy
-      - movingLeft / movingRight
-      - facingRight
-      - packet fields required to replay the same movement packet
+    Dead:
+        discard current attempt
+        anchor = None
+        events = []
 
-    No keyboard hook.
-    No interpolation.
-    No fake checkpoints.
+    Alive:
+        t = 0
+        fresh attempt
+
+    If a room does not emit an Alive activity packet reliably,
+    the first real movement can start a movement-fallback life.
+
+    finishMs is NOT trusted from the server packet anymore.
+    It is measured locally from our own monotonic Alive -> Victory clock.
     """
 
-    VERSION = 1
+    VERSION = 2
+    LIFE_TIMER_VERSION = 2
 
     def __init__(self):
         self.lock = threading.RLock()
@@ -33,13 +38,13 @@ class Recorder:
         self.context = None
         self.anchor_ns = None
         self.events = []
+        self.life_index = 0
 
-        # Preserve facing while both movement flags are false.
         self.facing_right = True
 
         print(
-            "[RECORDER] V1 ready "
-            "(real client coordinates only)"
+            "[RECORDER] V1.8 ready "
+            "(life timer resets on every death)"
         )
 
     @staticmethod
@@ -65,6 +70,7 @@ class Recorder:
             self.active = False
             self.anchor_ns = None
             self.events = []
+            self.life_index = 0
             self.facing_right = True
 
             self.context = {
@@ -90,13 +96,18 @@ class Recorder:
             self.anchor_ns = None
             self.context = None
             self.events = []
+            self.facing_right = True
 
         if was_armed:
             print(
                 f"[RECORD] OFF reason={reason}"
             )
 
-    def on_alive(self, anchor_ns=None):
+    def on_alive(
+        self,
+        anchor_ns=None,
+        source="activity",
+    ):
         if anchor_ns is None:
             anchor_ns = time.perf_counter_ns()
 
@@ -104,41 +115,78 @@ class Recorder:
             if not self.armed:
                 return False
 
+            # Duplicate Alive should not restart a currently active life.
+            if self.active and self.anchor_ns is not None:
+                return False
+
             self.active = True
             self.anchor_ns = int(anchor_ns)
             self.events = []
             self.facing_right = True
+            self.life_index += 1
+
+            life_index = self.life_index
 
         print(
-            "[RECORD] ALIVE -> t=0 "
-            "attempt started"
+            f"[RECORD LIFE] ALIVE -> t=0 "
+            f"life={life_index} source={source}"
         )
 
         return True
 
+    def ensure_alive_from_movement(
+        self,
+        observed_ns=None,
+    ):
+        """
+        Fallback for room modes where Alive update is late/missing.
+        """
+        if observed_ns is None:
+            observed_ns = time.perf_counter_ns()
+
+        with self.lock:
+            if not self.armed:
+                return False
+
+            if self.active and self.anchor_ns is not None:
+                return False
+
+        return self.on_alive(
+            observed_ns,
+            source="movement-fallback",
+        )
+
     def on_death(self, source):
         """
-        A dead attempt is NOT saved.
-        Record mode stays armed so the next Alive starts a fresh attempt.
+        Failed life is never kept as replay data.
         """
         with self.lock:
             if not self.armed:
-                return
+                return False
 
             discarded = len(
                 self.events
             )
 
+            was_active = (
+                self.active
+                or self.anchor_ns is not None
+                or discarded > 0
+            )
+
             self.active = False
             self.anchor_ns = None
             self.events = []
+            self.facing_right = True
 
         print(
-            f"[RECORD] DEATH "
+            f"[RECORD LIFE] DEAD -> RESET t=0 "
             f"source={source} "
             f"discardedPoints={discarded} "
             "waitingForNextAlive=True"
         )
+
+        return was_active
 
     def record_movement(
         self,
@@ -263,8 +311,11 @@ class Recorder:
                 event
             )
 
+            life_index = self.life_index
+
         print(
             f"[REC POS] "
+            f"life={life_index} "
             f"{t_us / 1_000_000:.6f}s "
             f"x={event['x']:.2f} "
             f"y={event['y']:.2f} "
@@ -278,23 +329,42 @@ class Recorder:
     def finish(
         self,
         *,
-        finish_seconds,
+        finish_seconds=None,
+        observed_ns=None,
     ):
         """
-        Called only on our own SERVER victory packet.
+        Success time is measured from OUR life anchor.
+
+        finish_seconds from server is retained only as debug/reference data.
         """
+        if observed_ns is None:
+            observed_ns = time.perf_counter_ns()
+
         with self.lock:
             if (
                 not self.armed
                 or not self.active
                 or self.context is None
+                or self.anchor_ns is None
                 or not self.events
             ):
                 return None
 
+            life_elapsed_seconds = max(
+                0.0,
+                (
+                    int(observed_ns)
+                    - self.anchor_ns
+                )
+                / 1_000_000_000.0,
+            )
+
             record = {
                 "version":
                     self.VERSION,
+
+                "lifeTimerVersion":
+                    self.LIFE_TIMER_VERSION,
 
                 "mapCode":
                     self.context["mapCode"],
@@ -305,11 +375,24 @@ class Recorder:
                 "mapHash":
                     self.context["mapHash"],
 
+                "roundId":
+                    self.context["roundId"],
+
+                "lifeIndex":
+                    self.life_index,
+
                 "finishMs":
-                    float(
-                        finish_seconds
-                    )
+                    life_elapsed_seconds
                     * 1000.0,
+
+                "reportedVictorySeconds":
+                    (
+                        None
+                        if finish_seconds is None
+                        else float(
+                            finish_seconds
+                        )
+                    ),
 
                 "events":
                     copy.deepcopy(
@@ -321,14 +404,19 @@ class Recorder:
                 self.events
             )
 
-            # Mode remains armed, but this attempt is complete.
+            life_index = self.life_index
+
             self.active = False
             self.anchor_ns = None
             self.events = []
+            self.facing_right = True
 
         print(
             f"[RECORD] VICTORY "
-            f"time={finish_seconds:.3f}s "
+            f"life={life_index} "
+            f"lifeTime={life_elapsed_seconds:.3f}s "
+            f"serverReported="
+            f"{'n/a' if finish_seconds is None else f'{float(finish_seconds):.3f}s'} "
             f"points={point_count}"
         )
 

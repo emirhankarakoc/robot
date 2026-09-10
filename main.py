@@ -8,13 +8,16 @@ SATELLITE_PORT = 12801
 
 def main():
     print("=" * 42)
-    print(" TFM V1.2 - SIMPLE RECORD / PLAY + LOCAL MIRROR")
+    print(" TFM V1.8 - LIFECYCLE-SAFE RECORD / SERVER PLAY / AUTOLEARN")
     print("=" * 42)
     print(f"[LISTEN] MAIN      {HOST}:{MAIN_PORT}")
     print(f"[LISTEN] SATELLITE {HOST}:{SATELLITE_PORT}")
     print("[DB] robot_records.db")
+    print("[COMMAND] /help")
     print("[COMMAND] /record on | /record off")
     print("[COMMAND] /play on   | /play off")
+    print("[COMMAND] /recordplayer Nick#0000 | /recordplayer off")
+    print("[COMMAND] /playplayer Nick#0000   | /playplayer off")
     print()
 
     proxy = TfmProxy(

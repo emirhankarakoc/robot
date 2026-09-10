@@ -12,13 +12,13 @@ from caseus.packets.common import (
 
 class Replayer:
     """
-    V1.2 coordinate replay.
+    V1.6 coordinate replay.
 
     Sends ONLY saved PlayerMovementPacket states to the backend,
     at the SAME recorded timestamps.
 
-    No keyboard.
-    No local mirror.
+    No physical keyboard injection.
+    Same saved coordinate state is mirrored to our own client.
     No interpolation.
     """
 
@@ -37,7 +37,7 @@ class Replayer:
                 pass
 
         print(
-            "[PLAYER] V1.2 ready "
+            "[PLAYER] V1.6 ready "
             "(recorded coordinates -> backend + local mirror)"
         )
 
