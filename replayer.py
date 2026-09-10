@@ -12,7 +12,7 @@ from caseus.packets.common import (
 
 class Replayer:
     """
-    V1.6 coordinate replay.
+    emirhankarakoc v1.2 replay.
 
     Sends ONLY saved PlayerMovementPacket states to the backend,
     at the SAME recorded timestamps.
@@ -37,7 +37,7 @@ class Replayer:
                 pass
 
         print(
-            "[PLAYER] V1.6 ready "
+            "[PLAYER] emirhankarakoc v1.2 ready "
             "(recorded coordinates -> backend + local mirror)"
         )
 
@@ -210,6 +210,29 @@ class Replayer:
             rotation_info=rotation,
         )
 
+    @staticmethod
+    def _log_server_packet(
+        packet,
+        event,
+        *,
+        reason="replay",
+    ):
+        print(
+            "[TX->SERVER] "
+            f"packet={type(packet).__name__} "
+            f"reason={reason} "
+            f"t={int(event.get('tUs', 0)) / 1_000_000:.6f}s "
+            f"round={getattr(packet, 'round_id', '?')} "
+            f"x={float(event.get('x', 0.0)):.2f} "
+            f"y={float(event.get('y', 0.0)):.2f} "
+            f"vx={float(event.get('velocityX', 0.0)):.2f} "
+            f"vy={float(event.get('velocityY', 0.0)):.2f} "
+            f"L={bool(event.get('movingLeft', False))} "
+            f"R={bool(event.get('movingRight', False))} "
+            f"jump={bool(event.get('jumping', False))} "
+            f"terminalHold={bool(event.get('terminalHold', False))}"
+        )
+
     async def _mirror_to_local_client(
         self,
         source_conn,
@@ -256,31 +279,48 @@ class Replayer:
             )
         )))
 
+        local_move = clientbound.MovePlayerPacket(
+            x=x,
+            y=y,
+            position_relative=False,
+            velocity_x=vx,
+            velocity_y=vy,
+            velocity_relative=False,
+        )
+
+        print(
+            "[TX->CLIENT] "
+            f"packet={type(local_move).__name__} "
+            f"x={x} y={y} vx={vx} vy={vy}"
+        )
+
         await source_conn.write_packet_instance(
-            clientbound.MovePlayerPacket(
-                x=x,
-                y=y,
-                position_relative=False,
-                velocity_x=vx,
-                velocity_y=vy,
-                velocity_relative=False,
-            )
+            local_move
         )
 
         if self_session_id is not None:
             try:
+                face_packet = clientbound.SetFacingPacket(
+                    session_id=int(
+                        self_session_id
+                    ),
+                    facing_right=bool(
+                        event.get(
+                            "facingRight",
+                            True,
+                        )
+                    ),
+                )
+
+                print(
+                    "[TX->CLIENT] "
+                    f"packet={type(face_packet).__name__} "
+                    f"session={self_session_id} "
+                    f"facingRight={bool(event.get('facingRight', True))}"
+                )
+
                 await source_conn.write_packet_instance(
-                    clientbound.SetFacingPacket(
-                        session_id=int(
-                            self_session_id
-                        ),
-                        facing_right=bool(
-                            event.get(
-                                "facingRight",
-                                True,
-                            )
-                        ),
-                    )
+                    face_packet
                 )
             except Exception as exc:
                 print(
@@ -353,6 +393,12 @@ class Replayer:
                     round_id,
                 )
 
+                self._log_server_packet(
+                    packet,
+                    event,
+                    reason="replay",
+                )
+
                 await (
                     source_conn
                     .destination
@@ -389,6 +435,48 @@ class Replayer:
                     f"face="
                     f"{'R' if event.get('facingRight', True) else 'L'}"
                 )
+
+            # Victory can occur while the final movement key is still held.
+            # Repeat the terminal state briefly so a sparse trajectory does
+            # not stop one packet before the server recognizes the hole.
+            events = self.record.get(
+                "events",
+                [],
+            )
+
+            if (
+                events
+                and bool(events[-1].get("terminalHold", False))
+            ):
+                terminal_event = events[-1]
+
+                for repeat_index in range(6):
+                    await asyncio.sleep(0.04)
+
+                    if (
+                        not self.active
+                        or generation != self.generation
+                    ):
+                        return
+
+                    packet = self._build_packet(
+                        terminal_event,
+                        round_id,
+                    )
+
+                    self._log_server_packet(
+                        packet,
+                        terminal_event,
+                        reason=f"terminal-grace-{repeat_index + 1}",
+                    )
+
+                    await (
+                        source_conn
+                        .destination
+                        .write_packet_instance(
+                            packet
+                        )
+                    )
 
             print(
                 "[PLAY] trajectory complete; "

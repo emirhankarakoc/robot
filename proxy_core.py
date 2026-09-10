@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import time
 
@@ -19,7 +20,7 @@ from winner_recorder import WinnerRecorder
 
 class TfmProxy(Proxy):
     """
-    TFM V1.11
+    TFM emirhankarakoc v1.2
 
     ONLY:
         /record on
@@ -68,8 +69,20 @@ class TfmProxy(Proxy):
         self.auto_record_fallback = False
         self.selected_route = None
 
-        # First PlayerVictoryPacket of a round is the winner we learn.
+        # First eligible finisher of a round is the route we learn.
         self.first_victory_session_id = None
+
+        # AFK farming:
+        # no route -> two synthetic jump pulses
+        # first eligible learned winner -> immediately arm/play that route
+        self.afk_farming = False
+        self.afk_jump_pending = False
+        self.afk_jump_task = None
+        self.afk_life_start_ns = None
+
+        self.self_victory_capture_pending = False
+        self.self_victory_capture_task = None
+        self.self_victory_capture_ns = None
 
         # Lightweight player directory used by /recordplayer Nick#0000.
         self.players_by_session = {}
@@ -101,7 +114,7 @@ class TfmProxy(Proxy):
         self.play_pending = False
 
         print(
-            "[PROXY] V1.11 listeners ready"
+            "[PROXY] emirhankarakoc v1.2 listeners ready"
         )
 
     # ==============================================================
@@ -120,6 +133,293 @@ class TfmProxy(Proxy):
             and self.current_round_id is not None
             and self.current_map_hash is not None
         )
+
+    @staticmethod
+    def _route_owner(route):
+        if not route:
+            return "UNKNOWN"
+
+        return str(
+            route.get("ownerName")
+            or route.get("targetName")
+            or "SELF"
+        )
+
+    @staticmethod
+    def _route_seconds(route):
+        if not route:
+            return None
+
+        if route.get("victorySeconds") is not None:
+            return float(route["victorySeconds"])
+
+        if route.get("finishMs") is not None:
+            return float(route["finishMs"]) / 1000.0
+
+        return None
+
+    def _cancel_afk_jump_task(self, reason):
+        task = self.afk_jump_task
+        self.afk_jump_task = None
+        self.afk_jump_pending = False
+
+        if task is not None and not task.done():
+            task.cancel()
+            print(f"[AFKFARMING] jump task cancelled reason={reason}")
+
+    @staticmethod
+    def _event_from_self_packet(packet):
+        rotation = packet.rotation_info
+
+        return {
+            "tUs": 0,
+            "x": float(packet.x),
+            "y": float(packet.y),
+            "velocityX": float(packet.velocity_x),
+            "velocityY": float(packet.velocity_y),
+            "movingLeft": bool(packet.moving_left),
+            "movingRight": bool(packet.moving_right),
+            "facingRight": (
+                True
+                if bool(packet.moving_right)
+                else False
+                if bool(packet.moving_left)
+                else True
+            ),
+            "jumping": bool(packet.jumping),
+            "jumpingFrameIndex": int(packet.jumping_frame_index),
+            "frictionCharge": float(packet.friction_info.charge),
+            "frictionLossRate": float(packet.friction_info.loss_rate),
+            "enteredPortal": int(
+                getattr(
+                    packet.entered_portal,
+                    "value",
+                    packet.entered_portal,
+                )
+            ),
+            "rotationInfo": (
+                None
+                if rotation is None
+                else {
+                    "rotation": float(rotation.rotation),
+                    "angularVelocity": float(rotation.angular_velocity),
+                    "fixedRotation": bool(rotation.fixed_rotation),
+                }
+            ),
+        }
+
+    async def _afk_jump_sequence(
+        self,
+        *,
+        source_conn,
+        base_event,
+        round_id,
+        life_start_ns,
+    ):
+        try:
+            # First jump at life+5.00s, second at life+5.75s.
+            for jump_number, target_offset_seconds in (
+                (1, 5.00),
+                (2, 5.75),
+            ):
+                elapsed = max(
+                    0.0,
+                    (
+                        time.perf_counter_ns()
+                        - int(life_start_ns)
+                    )
+                    / 1_000_000_000.0,
+                )
+
+                delay = max(
+                    0.0,
+                    target_offset_seconds - elapsed,
+                )
+
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                if (
+                    not self.afk_farming
+                    or not self.afk_jump_pending
+                    or self.current_round_id != round_id
+                    or self.selected_route is not None
+                ):
+                    return
+
+                jump_event = dict(base_event)
+                jump_event["jumping"] = True
+                jump_event["velocityY"] = -50.0
+                jump_event["jumpingFrameIndex"] = int(
+                    jump_event.get("jumpingFrameIndex", 0)
+                ) + jump_number
+
+                packet = self.replayer._build_packet(
+                    jump_event,
+                    round_id,
+                )
+
+                actual_elapsed = (
+                    time.perf_counter_ns()
+                    - int(life_start_ns)
+                ) / 1_000_000_000.0
+
+                print(
+                    "[TX->SERVER] "
+                    f"packet={type(packet).__name__} "
+                    f"reason=afkfarming-jump-{jump_number} "
+                    f"lifeT={actual_elapsed:.3f}s "
+                    f"map=@{self.current_map} "
+                    f"round={round_id} "
+                    f"x={jump_event['x']:.2f} "
+                    f"y={jump_event['y']:.2f} "
+                    f"vy={jump_event['velocityY']:.2f} "
+                    "jump=True"
+                )
+
+                await (
+                    source_conn.destination
+                    .write_packet_instance(packet)
+                )
+
+                await asyncio.sleep(0.10)
+
+                if (
+                    not self.afk_farming
+                    or self.current_round_id != round_id
+                    or self.selected_route is not None
+                ):
+                    return
+
+                release_event = dict(base_event)
+                release_event["jumping"] = False
+                release_event["velocityY"] = 0.0
+
+                release_packet = self.replayer._build_packet(
+                    release_event,
+                    round_id,
+                )
+
+                print(
+                    "[TX->SERVER] "
+                    f"packet={type(release_packet).__name__} "
+                    f"reason=afkfarming-jump-{jump_number}-release "
+                    f"map=@{self.current_map} "
+                    f"round={round_id} "
+                    "jump=False"
+                )
+
+                await (
+                    source_conn.destination
+                    .write_packet_instance(release_packet)
+                )
+
+        except asyncio.CancelledError:
+            return
+
+        except Exception as exc:
+            print(
+                f"[AFKFARMING ERROR] "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        finally:
+            self.afk_jump_task = None
+
+    def _maybe_start_afk_jumps(self, source_conn, packet):
+        if (
+            not self.afk_farming
+            or not self.afk_jump_pending
+            or self.selected_route is not None
+            or self.afk_jump_task is not None
+            or source_conn is None
+            or source_conn.destination is None
+            or self.current_round_id is None
+            or self.afk_life_start_ns is None
+        ):
+            return
+
+        base_event = self._event_from_self_packet(packet)
+        round_id = int(self.current_round_id)
+        life_start_ns = int(self.afk_life_start_ns)
+
+        self.afk_jump_task = asyncio.create_task(
+            self._afk_jump_sequence(
+                source_conn=source_conn,
+                base_event=base_event,
+                round_id=round_id,
+                life_start_ns=life_start_ns,
+            )
+        )
+
+        elapsed = (
+            time.perf_counter_ns()
+            - life_start_ns
+        ) / 1_000_000_000.0
+
+        print(
+            f"[AFKFARMING] no route map=@{self.current_map} "
+            f"lifeT={elapsed:.3f}s "
+            "-> jumps scheduled for 5.00s / 5.75s"
+        )
+
+    async def _activate_learned_route_now(self, route):
+        if not route or not self._map_context_ready():
+            return False
+
+        owner = self._route_owner(route)
+        seconds = self._route_seconds(route)
+
+        self._cancel_afk_jump_task(
+            "winner-route-ready"
+        )
+
+        if self.recorder.armed:
+            self.recorder.on_death(
+                "afkfarming-winner-route"
+            )
+
+        self.play_mode = True
+        self.auto_record_fallback = False
+        self.selected_route = route
+        self.play_pending = True
+
+        self.replayer.stop(
+            "afkfarming-new-winner"
+        )
+        self.replayer.arm(
+            route
+        )
+
+        started = False
+
+        if (
+            self.self_alive
+            and self.serverbound_source is not None
+        ):
+            started = self.replayer.start(
+                round_id=self.current_round_id,
+                source_conn=self.serverbound_source,
+                self_session_id=self.self_session_id,
+            )
+            self.play_pending = not started
+
+        await self._chat(
+            f"AFKFARMING | winner route ready "
+            f"@{self.current_map} | {owner} | "
+            f"{seconds:.3f}s | "
+            f"{'PLAYING NOW' if started else 'ARMED'}"
+        )
+
+        print(
+            f"[AFKFARMING] route activated "
+            f"map=@{self.current_map} "
+            f"owner={owner} "
+            f"time={seconds:.3f}s "
+            f"started={started}"
+        )
+
+        return started
 
     def _arm_record_for_current_map(self):
         if not (
@@ -197,10 +497,14 @@ class TfmProxy(Proxy):
             or "SELF"
         )
 
+        route_seconds = self._route_seconds(route)
+
         print(
             f"[AUTOLEARN] ROUTE READY "
+            f"map=@{self.current_map} "
             f"id={route.get('id')} "
-            f"source={source_name} "
+            f"owner={source_name} "
+            f"time={route_seconds:.3f}s "
             f"points={len(route.get('events', []))}"
         )
 
@@ -265,6 +569,7 @@ class TfmProxy(Proxy):
                 )
 
         self.self_alive = True
+        self.afk_life_start_ns = int(observed_ns)
 
         print(
             f"[LIFE] ALIVE "
@@ -319,6 +624,7 @@ class TfmProxy(Proxy):
         was_alive = self.self_alive
         self.self_alive = False
         self.last_self_alive_signal_ns = None
+        self.afk_life_start_ns = None
 
         print(
             f"[LIFE] DEAD -> RESET t=0 "
@@ -327,10 +633,17 @@ class TfmProxy(Proxy):
             f"wasAlive={was_alive}"
         )
 
-        # Always clear Recorder if it owns a life.
-        if self.recorder.armed:
+        if (
+            self.recorder.armed
+            and not self.self_victory_capture_pending
+        ):
             self.recorder.on_death(
                 source_name
+            )
+        elif self.self_victory_capture_pending:
+            print(
+                "[LIFE] DEAD during victory capture "
+                "-> keeping recorder until final snapshot"
             )
 
         if self.play_mode:
@@ -356,7 +669,7 @@ class TfmProxy(Proxy):
         try:
             await conn.write_packet(
                 clientbound.GeneralMessagePacket,
-                message=f"<J>[V1.11]</J> {message}",
+                message=f"<J>[emirhankarakoc v1.2]</J> {message}",
             )
         except Exception as exc:
             print(
@@ -547,12 +860,21 @@ class TfmProxy(Proxy):
             record
         )
 
-        await self._chat(
-            f"recordplayer saved #{record_id}: "
-            f"{record['targetName']} | "
-            f"{len(record['events'])} points | "
-            f"{record['reason']}"
-        )
+        if record_id is not None:
+            await self._chat(
+                f"recordplayer BEST saved #{record_id} | "
+                f"@{record['mapCode']} | "
+                f"{record['targetName']} | "
+                f"{record['victorySeconds']:.3f}s | "
+                f"{len(record['events'])} points"
+            )
+        else:
+            print(
+                f"[RECORDPLAYER] not stored "
+                f"map=@{record['mapCode']} "
+                f"owner={record['targetName']} "
+                f"time={record['victorySeconds']:.3f}s"
+            )
 
         return record_id
 
@@ -608,9 +930,14 @@ class TfmProxy(Proxy):
             "new-round"
         )
 
+        self._cancel_afk_jump_task(
+            "new-round"
+        )
+
         self.play_pending = False
         self.self_alive = False
         self.last_self_alive_signal_ns = None
+        self.afk_life_start_ns = None
 
         self.current_map = int(
             packet.map_code
@@ -663,6 +990,7 @@ class TfmProxy(Proxy):
         self.winner_recorder.set_enabled(
             self.record_mode
             or self.play_mode
+            or self.afk_farming
         )
 
         self.winner_recorder.new_round(
@@ -677,14 +1005,59 @@ class TfmProxy(Proxy):
         self.auto_record_fallback = False
         self.play_pending = False
 
+        # ALWAYS show the currently usable record at hand start.
+        round_best = self.store.get_best_any_route(
+            map_code=self.current_map,
+            mirrored=self.current_mirrored,
+            map_hash=self.current_map_hash,
+        )
+
+        if round_best is not None:
+            owner = self._route_owner(round_best)
+            seconds = self._route_seconds(round_best)
+
+            await self._chat(
+                f"ROUND @{self.current_map} | "
+                f"BEST {seconds:.3f}s | "
+                f"owner={owner} | "
+                f"{len(round_best.get('events', []))} points"
+            )
+
+            print(
+                f"[ROUND BEST] map=@{self.current_map} "
+                f"owner={owner} "
+                f"time={seconds:.3f}s "
+                f"points={len(round_best.get('events', []))}"
+            )
+        else:
+            print(
+                f"[ROUND BEST] map=@{self.current_map} NONE"
+            )
+
+            await self._chat(
+                f"ROUND @{self.current_map} | NO SAVED RUN"
+            )
+
+        # AFK farming owns autoplay when a route already exists.
+        if self.afk_farming and round_best is not None:
+            self.play_mode = True
+
+        self.afk_jump_pending = (
+            self.afk_farming
+            and round_best is None
+        )
+
         if self.play_mode:
-            # V1.6:
-            # choose best self/learned-winner route and replay it to
-            # the owned backend. If nothing exists, record our normal run.
             self._load_play_for_current_map()
 
         elif self.record_mode:
             self._arm_record_for_current_map()
+
+        if self.afk_farming and round_best is None:
+            await self._chat(
+                f"AFKFARMING @{self.current_map} | "
+                "no run: 2 jumps armed; first eligible winner -> instant replay"
+            )
 
     # ==============================================================
     # ALIVE / DEAD FROM SERVER
@@ -830,6 +1203,223 @@ class TfmProxy(Proxy):
             if argument_raw is not None
             else None
         )
+
+        # --------------------------
+        # /afkfarming on|off
+        # --------------------------
+
+        if command == "afkfarming":
+            if argument is None:
+                await self._chat(
+                    f"AFKFARMING={'ON' if self.afk_farming else 'OFF'}",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            if argument in ("on", "start"):
+                self.afk_farming = True
+                self.winner_recorder.set_enabled(True)
+
+                route = None
+                if self._map_context_ready():
+                    route = self.store.get_best_any_route(
+                        map_code=self.current_map,
+                        mirrored=self.current_mirrored,
+                        map_hash=self.current_map_hash,
+                    )
+
+                if route is not None:
+                    self.play_mode = True
+                    self.selected_route = None
+                    self._load_play_for_current_map()
+
+                    await self._chat(
+                        f"AFKFARMING ON | existing run found "
+                        f"@{self.current_map}; autoplay enabled",
+                        source,
+                    )
+                else:
+                    self.afk_jump_pending = self._map_context_ready()
+
+                    await self._chat(
+                        "AFKFARMING ON | no run => 2 jumps, "
+                        "then first eligible winner is replayed immediately",
+                        source,
+                    )
+
+                print("[MODE] AFKFARMING=ON")
+                return self.DO_NOTHING
+
+            if argument in ("off", "stop"):
+                self.afk_farming = False
+                self._cancel_afk_jump_task("afkfarming-off")
+
+                self.winner_recorder.set_enabled(
+                    self.record_mode or self.play_mode
+                )
+
+                await self._chat(
+                    "AFKFARMING OFF",
+                    source,
+                )
+                print("[MODE] AFKFARMING=OFF")
+                return self.DO_NOTHING
+
+            await self._chat(
+                "usage: /afkfarming on | /afkfarming off",
+                source,
+            )
+            return self.DO_NOTHING
+
+        # --------------------------
+        # /blacklist ...
+        # --------------------------
+
+        if command == "blacklist":
+            if argument_raw is None or argument == "list":
+                names = self.store.blacklist_list()
+
+                if not names:
+                    await self._chat(
+                        "BLACKLIST | empty",
+                        source,
+                    )
+                else:
+                    await self._chat(
+                        "BLACKLIST | " + ", ".join(names[:20]),
+                        source,
+                    )
+
+                return self.DO_NOTHING
+
+            tokens = argument_raw.split(
+                maxsplit=1
+            )
+
+            action = tokens[0].lower()
+
+            if action == "clear":
+                count = self.store.blacklist_clear()
+                await self._chat(
+                    f"BLACKLIST CLEARED | {count}",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            if action in ("remove", "del", "delete"):
+                if len(tokens) < 2:
+                    await self._chat(
+                        "usage: /blacklist remove Nick#0000",
+                        source,
+                    )
+                    return self.DO_NOTHING
+
+                name = tokens[1].strip()
+                count = self.store.blacklist_remove(name)
+
+                await self._chat(
+                    f"BLACKLIST REMOVE | {name} | rows={count}",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            if action == "add":
+                if len(tokens) < 2:
+                    await self._chat(
+                        "usage: /blacklist add Nick#0000",
+                        source,
+                    )
+                    return self.DO_NOTHING
+                name = tokens[1].strip()
+            else:
+                # Convenience:
+                # /blacklist Nick#0000
+                name = argument_raw.strip()
+
+            deleted = self.store.blacklist_add(name)
+
+            current_owner = self._route_owner(
+                self.selected_route
+            ) if self.selected_route else None
+
+            if (
+                current_owner is not None
+                and current_owner.casefold()
+                == name.casefold()
+            ):
+                self.replayer.stop(
+                    "blacklisted-current-owner"
+                )
+                self.selected_route = None
+                self.play_pending = False
+
+                if self.play_mode and self._map_context_ready():
+                    self._load_play_for_current_map()
+
+            await self._chat(
+                f"BLACKLIST ADD | {name} | "
+                f"removedRecords={deleted}",
+                source,
+            )
+            return self.DO_NOTHING
+
+        # --------------------------
+        # /timeowner @mapCode Nick#0000
+        # --------------------------
+
+        if command == "timeowner":
+            if argument_raw is None:
+                await self._chat(
+                    "usage: /timeowner @7680000 Nick#0000",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            tokens = argument_raw.split(
+                maxsplit=1
+            )
+
+            if len(tokens) != 2:
+                await self._chat(
+                    "usage: /timeowner @7680000 Nick#0000",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            map_text = tokens[0].strip()
+            new_owner = tokens[1].strip()
+
+            if map_text.startswith("@"):
+                map_text = map_text[1:]
+
+            try:
+                map_code = int(map_text)
+            except ValueError:
+                await self._chat(
+                    "usage: /timeowner @7680000 Nick#0000",
+                    source,
+                )
+                return self.DO_NOTHING
+
+            result = self.store.set_best_owner(
+                map_code=map_code,
+                new_owner=new_owner,
+            )
+
+            if result["ok"]:
+                await self._chat(
+                    f"OWNER @{map_code} | "
+                    f"{result['oldOwner']} -> {result['newOwner']} | "
+                    f"{result['seconds']:.3f}s",
+                    source,
+                )
+            else:
+                await self._chat(
+                    f"OWNER @{map_code} failed | {result['reason']}",
+                    source,
+                )
+
+            return self.DO_NOTHING
 
         # --------------------------
         # /timelist [@mapCode]
@@ -1011,6 +1601,12 @@ class TfmProxy(Proxy):
                 else "OFF"
             )
 
+            afk_status = (
+                "ON"
+                if self.afk_farming
+                else "OFF"
+            )
+
             recordplayer_target = (
                 self.player_recorder.target_name
             )
@@ -1027,7 +1623,8 @@ class TfmProxy(Proxy):
             help_lines = [
                 (
                     f"STATUS | RECORD={record_status} "
-                    f"| PLAY={play_status}"
+                    f"| PLAY={play_status} "
+                    f"| AFKFARMING={afk_status}"
                 ),
 
                 (
@@ -1075,6 +1672,20 @@ class TfmProxy(Proxy):
                 ),
 
                 (
+                    "/afkfarming on/off | run yoksa 2 jump; "
+                    "ilk uygun winner gelince aninda replay."
+                ),
+
+                (
+                    "/blacklist add/remove/list/clear Nick | "
+                    "blacklisted owner recordlari kullanilmaz."
+                ),
+
+                (
+                    "/timeowner @map Nick | BEST kaydin owner bilgisini degistirir."
+                ),
+
+                (
                     "/timelist [@map] | sadece mevcut BEST kaydi gosterir."
                 ),
 
@@ -1090,7 +1701,7 @@ class TfmProxy(Proxy):
 
             print()
             print("=" * 54)
-            print(" TFM V1.11 HELP")
+            print(" TFM emirhankarakoc v1.2 HELP")
             print("=" * 54)
 
             for line in help_lines:
@@ -1431,6 +2042,7 @@ class TfmProxy(Proxy):
 
                 self.winner_recorder.set_enabled(
                     self.record_mode
+                    or self.afk_farming
                 )
 
                 print(
@@ -1472,11 +2084,39 @@ class TfmProxy(Proxy):
 
         observed_ns = time.perf_counter_ns()
 
+        if self.self_victory_capture_pending:
+            if self.recorder.armed and self.recorder.active:
+                self.recorder.record_movement(
+                    packet,
+                    observed_ns=observed_ns,
+                )
+
+                print(
+                    "[REC POST-VICTORY MOVEMENT] "
+                    f"x={float(packet.x):.2f} "
+                    f"y={float(packet.y):.2f} "
+                    f"vx={float(packet.velocity_x):.2f} "
+                    f"vy={float(packet.velocity_y):.2f} "
+                    f"L={bool(packet.moving_left)} "
+                    f"R={bool(packet.moving_right)} "
+                    f"jump={bool(packet.jumping)}"
+                )
+
+            return
+
+        self._maybe_start_afk_jumps(
+            source,
+            packet,
+        )
+
         # Movement itself proves the player is alive.
         # This fallback is important in training/racing rooms where an
         # Alive activity update may arrive late or not at all.
         if not self.self_alive:
             self.self_alive = True
+
+            if self.afk_life_start_ns is None:
+                self.afk_life_start_ns = int(observed_ns)
 
             print(
                 "[LIFE] SELF movement-fallback "
@@ -1585,10 +2225,17 @@ class TfmProxy(Proxy):
         self.self_alive = False
         self.last_self_alive_signal_ns = None
 
-        # Any real client death ends the current attempt.
-        if self.recorder.armed:
+        if (
+            self.recorder.armed
+            and not self.self_victory_capture_pending
+        ):
             self.recorder.on_death(
                 "client-death"
+            )
+        elif self.self_victory_capture_pending:
+            print(
+                "[DEATH] death during victory capture "
+                "-> keeping successful recorder state"
             )
 
         if self.replayer.is_active():
@@ -1648,6 +2295,76 @@ class TfmProxy(Proxy):
             packet
         )
 
+    async def _finalize_self_victory_after_capture(
+        self,
+        *,
+        victory_ns,
+        finish_seconds,
+        victory_round_id,
+        save_mode,
+    ):
+        try:
+            await asyncio.sleep(0.150)
+
+            context = self.recorder.context
+
+            if (
+                context is None
+                or int(context.get("roundId", -1))
+                != int(victory_round_id)
+            ):
+                print(
+                    "[RECORD FINALIZE SKIP] "
+                    f"victoryRound={victory_round_id} "
+                    "recorder context changed"
+                )
+                return
+
+            record = self.recorder.finish(
+                finish_seconds=finish_seconds,
+                observed_ns=victory_ns,
+            )
+
+            if record is None:
+                print("[RECORD FINALIZE] no active record")
+                return
+
+            record["ownerName"] = self.self_name or "SELF"
+            record["targetName"] = record["ownerName"]
+
+            record_id = self.store.save(record)
+
+            print(
+                f"[RECORD FINALIZED] "
+                f"mode={save_mode} "
+                f"map=@{record['mapCode']} "
+                f"owner={record['ownerName']} "
+                f"time={record['finishMs'] / 1000.0:.3f}s "
+                f"points={len(record['events'])} "
+                f"stored={'yes' if record_id is not None else 'no'}"
+            )
+
+            await self._chat(
+                f"{save_mode} saved | "
+                f"@{record['mapCode']} | "
+                f"{record['finishMs'] / 1000.0:.3f}s life | "
+                f"{len(record['events'])} points"
+            )
+
+        except asyncio.CancelledError:
+            return
+
+        except Exception as exc:
+            print(
+                "[RECORD FINALIZE ERROR] "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        finally:
+            self.self_victory_capture_pending = False
+            self.self_victory_capture_task = None
+            self.self_victory_capture_ns = None
+
     # ==============================================================
     # SERVER VICTORY
     # ==============================================================
@@ -1660,45 +2377,121 @@ class TfmProxy(Proxy):
         source,
         packet,
     ):
-        # Learn only the FIRST finisher of the round.
-        #
-        # We deliberately record remote movement passively from server
-        # broadcasts, then make that route eligible for future autoplay.
-        is_first_victory = (
-            self.first_victory_session_id is None
-        )
-
-        if is_first_victory:
-            self.first_victory_session_id = int(
+        # Learn the first ELIGIBLE finisher.
+        # Blacklisted owners are ignored so they cannot poison training data.
+        if self.first_victory_session_id is None:
+            winner_session_id = int(
                 packet.session_id
             )
 
-            winner_record = self.winner_recorder.winner_record(
-                packet.session_id,
-                float(packet.seconds),
+            winner_name = self.players_by_session.get(
+                winner_session_id,
+                (
+                    self.self_name
+                    if (
+                        self.self_session_id is not None
+                        and winner_session_id == int(self.self_session_id)
+                    )
+                    else f"session-{winner_session_id}"
+                ),
             )
 
-            if winner_record is not None:
-                self.store.save_player_record(
-                    winner_record
+            if self.store.is_blacklisted(
+                winner_name
+            ):
+                print(
+                    f"[FIRST PLACE SKIP] "
+                    f"map=@{self.current_map} "
+                    f"owner={winner_name} "
+                    "reason=blacklisted"
                 )
 
                 await self._chat(
-                    f"FIRST PLACE learned: "
-                    f"{winner_record['targetName']} | "
-                    f"{float(packet.seconds):.3f}s | "
-                    f"{len(winner_record['events'])} points"
+                    f"FIRST PLACE skipped | "
+                    f"@{self.current_map} | "
+                    f"{winner_name} | BLACKLISTED"
                 )
 
-            elif (
-                self.self_session_id is not None
-                and int(packet.session_id)
-                == int(self.self_session_id)
-            ):
-                print(
-                    "[AUTOLEARN] we were first; "
-                    "no remote winner route needed"
+            else:
+                winner_record = self.winner_recorder.winner_record(
+                    packet.session_id,
+                    float(packet.seconds),
                 )
+
+                # Self winner is stored by the normal self recorder below.
+                if (
+                    winner_record is None
+                    and self.self_session_id is not None
+                    and winner_session_id == int(self.self_session_id)
+                ):
+                    self.first_victory_session_id = winner_session_id
+
+                    print(
+                        f"[FIRST PLACE] "
+                        f"map=@{self.current_map} "
+                        f"owner={self.self_name} "
+                        f"serverTime={float(packet.seconds):.3f}s "
+                        "source=self"
+                    )
+
+                elif winner_record is not None:
+                    learned_seconds = float(
+                        winner_record["victorySeconds"]
+                    )
+
+                    if learned_seconds < self.store.MIN_RECORD_SECONDS:
+                        print(
+                            f"[FIRST PLACE SKIP] "
+                            f"map=@{self.current_map} "
+                            f"owner={winner_record['targetName']} "
+                            f"time={learned_seconds:.3f}s "
+                            f"reason=under-{self.store.MIN_RECORD_SECONDS:.0f}s"
+                        )
+
+                        await self._chat(
+                            f"FIRST PLACE skipped | "
+                            f"@{self.current_map} | "
+                            f"{winner_record['targetName']} | "
+                            f"{learned_seconds:.3f}s < "
+                            f"{self.store.MIN_RECORD_SECONDS:.0f}s"
+                        )
+                    else:
+                        self.first_victory_session_id = winner_session_id
+
+                        record_id = self.store.save_player_record(
+                            winner_record
+                        )
+
+                        print(
+                            f"[FIRST PLACE learned] "
+                            f"map=@{self.current_map} | "
+                            f"{winner_record['targetName']} | "
+                            f"{learned_seconds:.3f}s | "
+                            f"{len(winner_record['events'])} points | "
+                            f"saved={'yes' if record_id is not None else 'no-faster-record'}"
+                        )
+
+                        await self._chat(
+                            f"FIRST PLACE learned | "
+                            f"@{self.current_map} | "
+                            f"{winner_record['targetName']} | "
+                            f"{learned_seconds:.3f}s | "
+                            f"{len(winner_record['events'])} points"
+                        )
+
+                        # If this hand started with no route, AFKFARMING
+                        # immediately turns on PLAY and starts the learned
+                        # winner trajectory in the SAME hand.
+                        if (
+                            self.afk_farming
+                            and self.afk_jump_pending
+                            and record_id is not None
+                        ):
+                            winner_record["id"] = record_id
+
+                            await self._activate_learned_route_now(
+                                winner_record
+                            )
 
         # Passive target victory.
         if (
@@ -1727,43 +2520,44 @@ class TfmProxy(Proxy):
             f"time={finish_seconds:.3f}s"
         )
 
-        # Recorder has one owner per round:
-        #   PLAY fallback when no route exists
-        #   otherwise plain RECORD mode
+        victory_ns = time.perf_counter_ns()
+
+        capture_mode = None
+
         if (
             self.play_mode
             and self.auto_record_fallback
+            and self.recorder.active
         ):
-            record = self.recorder.finish(
-                finish_seconds=finish_seconds
+            capture_mode = "autolearn"
+
+        elif self.record_mode and self.recorder.active:
+            capture_mode = "record"
+
+        if capture_mode is not None:
+            self.self_victory_capture_pending = True
+            self.self_victory_capture_ns = victory_ns
+
+            if (
+                self.self_victory_capture_task is not None
+                and not self.self_victory_capture_task.done()
+            ):
+                self.self_victory_capture_task.cancel()
+
+            self.self_victory_capture_task = asyncio.create_task(
+                self._finalize_self_victory_after_capture(
+                    victory_ns=victory_ns,
+                    finish_seconds=finish_seconds,
+                    victory_round_id=int(self.current_round_id),
+                    save_mode=capture_mode,
+                )
             )
 
-            if record is not None:
-                self.store.save(
-                    record
-                )
-
-                await self._chat(
-                    f"autolearn saved OUR run | "
-                    f"{record['finishMs'] / 1000.0:.3f}s life | "
-                    f"{len(record['events'])} points"
-                )
-
-        elif self.record_mode:
-            record = self.recorder.finish(
-                finish_seconds=finish_seconds
+            print(
+                "[VICTORY CAPTURE] "
+                f"map=@{self.current_map} "
+                "150ms final-movement window OPEN"
             )
-
-            if record is not None:
-                self.store.save(
-                    record
-                )
-
-                await self._chat(
-                    f"record saved | "
-                    f"{record['finishMs'] / 1000.0:.3f}s life | "
-                    f"{len(record['events'])} points"
-                )
 
         if self.play_mode:
             self.replayer.stop(
@@ -1774,3 +2568,4 @@ class TfmProxy(Proxy):
 
         self.self_alive = False
         self.last_self_alive_signal_ns = None
+        self.afk_life_start_ns = None

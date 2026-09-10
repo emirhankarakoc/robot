@@ -43,7 +43,7 @@ class Recorder:
         self.facing_right = True
 
         print(
-            "[RECORDER] V1.9 ready "
+            "[RECORDER] emirhankarakoc v1.2 ready "
             "(life timer resets on every death)"
         )
 
@@ -359,6 +359,59 @@ class Recorder:
                 / 1_000_000_000.0,
             )
 
+            finish_us = int(
+                round(
+                    life_elapsed_seconds
+                    * 1_000_000.0
+                )
+            )
+
+            all_events = copy.deepcopy(
+                self.events
+            )
+
+            # Keep trajectory timestamps only up to victory.
+            # If a REAL movement packet races in after victory, use its
+            # state as the final snapshot but clamp it to exact victory time.
+            saved_events = [
+                event
+                for event in all_events
+                if int(event.get("tUs", 0)) < finish_us
+            ]
+
+            trailing_events = [
+                event
+                for event in all_events
+                if int(event.get("tUs", 0)) >= finish_us
+            ]
+
+            final_source = (
+                all_events[-1]
+                if all_events
+                else None
+            )
+
+            if final_source is not None:
+                terminal = copy.deepcopy(
+                    final_source
+                )
+                terminal["tUs"] = finish_us
+                terminal["terminalHold"] = True
+                terminal["postVictoryCaptured"] = bool(
+                    trailing_events
+                )
+                saved_events.append(
+                    terminal
+                )
+
+            print(
+                f"[RECORD FINAL SNAPSHOT] "
+                f"finish={finish_us / 1_000_000:.6f}s "
+                f"rawEvents={len(all_events)} "
+                f"postVictoryPackets={len(trailing_events)} "
+                f"savedEvents={len(saved_events)}"
+            )
+
             record = {
                 "version":
                     self.VERSION,
@@ -395,13 +448,11 @@ class Recorder:
                     ),
 
                 "events":
-                    copy.deepcopy(
-                        self.events
-                    ),
+                    saved_events,
             }
 
             point_count = len(
-                self.events
+                saved_events
             )
 
             life_index = self.life_index

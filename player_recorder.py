@@ -460,6 +460,33 @@ class PlayerRecorder:
                 / 1_000_000_000.0,
             )
 
+            finish_us = int(
+                round(
+                    life_elapsed_seconds
+                    * 1_000_000.0
+                )
+            )
+
+            all_events = copy.deepcopy(
+                self.events
+            )
+
+            saved_events = [
+                event
+                for event in all_events
+                if int(event.get("tUs", 0)) < finish_us
+            ]
+
+            if all_events:
+                terminal = copy.deepcopy(
+                    all_events[-1]
+                )
+                terminal["tUs"] = finish_us
+                terminal["terminalHold"] = True
+                saved_events.append(
+                    terminal
+                )
+
             record = {
                 "version": 3,
                 "lifeTimerVersion":
@@ -507,9 +534,7 @@ class PlayerRecorder:
                     ),
 
                 "events":
-                    copy.deepcopy(
-                        self.events
-                    ),
+                    saved_events,
             }
 
             self.alive = False

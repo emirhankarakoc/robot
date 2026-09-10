@@ -516,6 +516,33 @@ class WinnerRecorder:
             )
         )
 
+        finish_us = int(
+            round(
+                life_elapsed_seconds
+                * 1_000_000.0
+            )
+        )
+
+        all_events = copy.deepcopy(
+            events
+        )
+
+        saved_events = [
+            event
+            for event in all_events
+            if int(event.get("tUs", 0)) < finish_us
+        ]
+
+        if all_events:
+            terminal = copy.deepcopy(
+                all_events[-1]
+            )
+            terminal["tUs"] = finish_us
+            terminal["terminalHold"] = True
+            saved_events.append(
+                terminal
+            )
+
         record = {
             "version": 3,
 
@@ -563,9 +590,7 @@ class WinnerRecorder:
                 ),
 
             "events":
-                copy.deepcopy(
-                    events
-                ),
+                saved_events,
         }
 
         print(
@@ -576,7 +601,7 @@ class WinnerRecorder:
             f"lifeTime={life_elapsed_seconds:.3f}s "
             f"serverReported="
             f"{'n/a' if reported_victory_seconds is None else f'{float(reported_victory_seconds):.3f}s'} "
-            f"points={len(events)}"
+            f"points={len(saved_events)}"
         )
 
         # Finished life must not continue collecting.

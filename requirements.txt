@@ -1,4 +1,1 @@
-# Your existing Caseus environment already provides these.
-# Kept here so the V1 project documents its only external dependency.
-caseus
-pak
+git+https://github.com/friedkeenan/caseus.git

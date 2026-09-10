@@ -6,37 +6,32 @@ from pathlib import Path
 
 class RecordStore:
     """
-    V1.11 SQLite store.
+    emirhankarakoc v1.1 storage
 
-    Old pre-lifecycle-fix rows are preserved but NOT selected for autoplay.
-
-    New rows use:
-        life_timer_version = 3
+    Rules:
+      - lifecycle v3 only
+      - minimum replayable time: 11.000 seconds
+      - one BEST record per exact map identity
+      - SELF and learned PLAYER routes compete for that one BEST
+      - blacklist is persistent
+      - records have an editable owner
     """
 
     LIFE_TIMER_VERSION = 3
+    MIN_RECORD_SECONDS = 11.0
 
-    def __init__(
-        self,
-        db_path="robot_records.db",
-    ):
-        self.db_path = Path(
-            db_path
-        )
-
+    def __init__(self, db_path="robot_records.db"):
+        self.db_path = Path(db_path)
         self.lock = threading.RLock()
 
         self.db = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
         )
-
         self.db.row_factory = sqlite3.Row
 
         with self.lock:
-            self.db.execute(
-                "PRAGMA journal_mode=WAL"
-            )
+            self.db.execute("PRAGMA journal_mode=WAL")
 
             self.db.execute(
                 """
@@ -48,10 +43,9 @@ class RecordStore:
                     finish_ms REAL NOT NULL,
                     event_count INTEGER NOT NULL,
                     payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                        DEFAULT CURRENT_TIMESTAMP,
-                    life_timer_version INTEGER NOT NULL
-                        DEFAULT 0
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    life_timer_version INTEGER NOT NULL DEFAULT 0,
+                    owner_name TEXT NOT NULL DEFAULT 'SELF'
                 )
                 """
             )
@@ -70,10 +64,18 @@ class RecordStore:
                     victory_seconds REAL,
                     event_count INTEGER NOT NULL,
                     payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                        DEFAULT CURRENT_TIMESTAMP,
-                    life_timer_version INTEGER NOT NULL
-                        DEFAULT 0
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    life_timer_version INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+
+            self.db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    name_key TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -83,7 +85,11 @@ class RecordStore:
                 "life_timer_version",
                 "INTEGER NOT NULL DEFAULT 0",
             )
-
+            self._ensure_column(
+                "records",
+                "owner_name",
+                "TEXT NOT NULL DEFAULT 'SELF'",
+            )
             self._ensure_column(
                 "player_records",
                 "life_timer_version",
@@ -92,50 +98,33 @@ class RecordStore:
 
             self.db.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_records_best_v2
+                CREATE INDEX IF NOT EXISTS idx_records_best_v3
                 ON records(
-                    map_code,
-                    mirrored,
-                    map_hash,
-                    life_timer_version,
-                    finish_ms
+                    map_code, mirrored, map_hash,
+                    life_timer_version, finish_ms
                 )
                 """
             )
-
             self.db.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_player_records_best_v2
+                CREATE INDEX IF NOT EXISTS idx_player_records_best_v3
                 ON player_records(
-                    map_code,
-                    mirrored,
-                    map_hash,
-                    life_timer_version,
-                    end_reason,
-                    victory_seconds
+                    map_code, mirrored, map_hash,
+                    life_timer_version, end_reason, victory_seconds
                 )
                 """
             )
-
             self.db.commit()
 
-        # V1.11 normalizes existing clean records:
-        # one BEST row per exact route key
-        # (mapCode + mirrored + mapHash), across self + learned players.
         self.compact_best_records()
 
         print(
-            f"[DB] ready "
-            f"path={self.db_path.resolve()} "
-            f"lifeTimerVersion={self.LIFE_TIMER_VERSION}"
+            f"[DB] ready path={self.db_path.resolve()} "
+            f"lifeTimerVersion={self.LIFE_TIMER_VERSION} "
+            f"minTime={self.MIN_RECORD_SECONDS:.3f}s"
         )
 
-    def _ensure_column(
-        self,
-        table,
-        column,
-        declaration,
-    ):
+    def _ensure_column(self, table, column, declaration):
         columns = {
             row["name"]
             for row in self.db.execute(
@@ -149,21 +138,113 @@ class RecordStore:
                 f"ADD COLUMN {column} {declaration}"
             )
 
-    def _best_exact_locked(
-        self,
-        *,
-        map_code,
-        mirrored,
-        map_hash,
-    ):
-        """
-        Return the fastest clean lifecycle-v3 row across BOTH tables
-        for one exact replay-compatible route key.
-        """
+    @staticmethod
+    def _key(name):
+        return str(name).strip().casefold()
+
+    def is_blacklisted(self, name):
+        if not name:
+            return False
+
+        with self.lock:
+            row = self.db.execute(
+                "SELECT 1 FROM blacklist WHERE name_key = ?",
+                (self._key(name),),
+            ).fetchone()
+
+        return row is not None
+
+    def blacklist_add(self, name):
+        name = str(name).strip()
+        if not name:
+            return 0
+
+        key = self._key(name)
+
+        with self.lock:
+            self.db.execute(
+                """
+                INSERT INTO blacklist(name_key, display_name)
+                VALUES(?, ?)
+                ON CONFLICT(name_key)
+                DO UPDATE SET
+                    display_name=excluded.display_name,
+                    created_at=CURRENT_TIMESTAMP
+                """,
+                (key, name),
+            )
+
+            deleted_self = self.db.execute(
+                "DELETE FROM records WHERE lower(owner_name)=lower(?)",
+                (name,),
+            ).rowcount
+
+            deleted_player = self.db.execute(
+                "DELETE FROM player_records WHERE lower(target_name)=lower(?)",
+                (name,),
+            ).rowcount
+
+            self.db.commit()
+
+        deleted = int(deleted_self or 0) + int(deleted_player or 0)
+
+        print(
+            f"[BLACKLIST] ADD {name} "
+            f"deletedOwnedRecords={deleted}"
+        )
+        return deleted
+
+    def blacklist_remove(self, name):
+        name = str(name).strip()
+        with self.lock:
+            count = self.db.execute(
+                "DELETE FROM blacklist WHERE name_key = ?",
+                (self._key(name),),
+            ).rowcount
+            self.db.commit()
+
+        print(f"[BLACKLIST] REMOVE {name} rows={int(count or 0)}")
+        return int(count or 0)
+
+    def blacklist_clear(self):
+        with self.lock:
+            count = self.db.execute(
+                "DELETE FROM blacklist"
+            ).rowcount
+            self.db.commit()
+
+        print(f"[BLACKLIST] CLEAR rows={int(count or 0)}")
+        return int(count or 0)
+
+    def blacklist_list(self):
+        with self.lock:
+            rows = self.db.execute(
+                """
+                SELECT display_name
+                FROM blacklist
+                ORDER BY lower(display_name)
+                """
+            ).fetchall()
+
+        return [str(row["display_name"]) for row in rows]
+
+    def _owner_blacklisted_locked(self, owner):
+        if not owner:
+            return False
+
+        row = self.db.execute(
+            "SELECT 1 FROM blacklist WHERE name_key = ?",
+            (self._key(owner),),
+        ).fetchone()
+
+        return row is not None
+
+    def _best_exact_locked(self, *, map_code, mirrored, map_hash):
         own = self.db.execute(
             """
             SELECT
                 id,
+                owner_name,
                 finish_ms / 1000.0 AS seconds,
                 event_count,
                 payload_json
@@ -172,6 +253,12 @@ class RecordStore:
               AND mirrored = ?
               AND map_hash = ?
               AND life_timer_version = ?
+              AND finish_ms >= ?
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM blacklist b
+                    WHERE b.name_key = lower(records.owner_name)
+              )
             ORDER BY finish_ms ASC
             LIMIT 1
             """,
@@ -180,6 +267,7 @@ class RecordStore:
                 int(bool(mirrored)),
                 str(map_hash),
                 self.LIFE_TIMER_VERSION,
+                self.MIN_RECORD_SECONDS * 1000.0,
             ),
         ).fetchone()
 
@@ -197,7 +285,12 @@ class RecordStore:
               AND map_hash = ?
               AND end_reason = 'victory'
               AND life_timer_version = ?
-              AND victory_seconds IS NOT NULL
+              AND victory_seconds >= ?
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM blacklist b
+                    WHERE b.name_key = lower(player_records.target_name)
+              )
             ORDER BY victory_seconds ASC
             LIMIT 1
             """,
@@ -206,6 +299,7 @@ class RecordStore:
                 int(bool(mirrored)),
                 str(map_hash),
                 self.LIFE_TIMER_VERSION,
+                self.MIN_RECORD_SECONDS,
             ),
         ).fetchone()
 
@@ -216,7 +310,7 @@ class RecordStore:
                 {
                     "source": "SELF",
                     "id": int(own["id"]),
-                    "name": "SELF",
+                    "name": str(own["owner_name"] or "SELF"),
                     "seconds": float(own["seconds"]),
                     "points": int(own["event_count"]),
                     "payload_json": own["payload_json"],
@@ -245,79 +339,61 @@ class RecordStore:
                 item["id"],
             )
         )
-
         return candidates[0]
 
-    def _delete_exact_locked(
-        self,
-        *,
-        map_code,
-        mirrored,
-        map_hash,
-    ):
-        own_count = self.db.execute(
+    def _delete_exact_locked(self, *, map_code, mirrored, map_hash):
+        a = self.db.execute(
             """
             DELETE FROM records
-            WHERE map_code = ?
-              AND mirrored = ?
-              AND map_hash = ?
+            WHERE map_code=? AND mirrored=? AND map_hash=?
             """,
-            (
-                int(map_code),
-                int(bool(mirrored)),
-                str(map_hash),
-            ),
+            (int(map_code), int(bool(mirrored)), str(map_hash)),
         ).rowcount
 
-        player_count = self.db.execute(
+        b = self.db.execute(
             """
             DELETE FROM player_records
-            WHERE map_code = ?
-              AND mirrored = ?
-              AND map_hash = ?
+            WHERE map_code=? AND mirrored=? AND map_hash=?
             """,
-            (
-                int(map_code),
-                int(bool(mirrored)),
-                str(map_hash),
-            ),
+            (int(map_code), int(bool(mirrored)), str(map_hash)),
         ).rowcount
 
-        return (
-            int(own_count or 0)
-            + int(player_count or 0)
-        )
+        return int(a or 0) + int(b or 0)
 
     def save(self, record):
-        """
-        BEST-ONLY SELF SAVE.
+        record = dict(record)
 
-        If there is no saved route:
-            insert
-
-        If this run is faster:
-            delete old self/player route(s) for the exact map key
-            insert this run
-
-        If this run is slower or equal:
-            do not save
-        """
         map_code = int(record["mapCode"])
         mirrored = bool(record["mirrored"])
         map_hash = str(record["mapHash"])
         seconds = float(record["finishMs"]) / 1000.0
 
-        payload = json.dumps(
-            record,
-            separators=(",", ":"),
+        owner = str(
+            record.get("ownerName")
+            or record.get("targetName")
+            or "SELF"
         )
 
-        life_timer_version = int(
-            record.get(
-                "lifeTimerVersion",
-                self.LIFE_TIMER_VERSION,
+        record["ownerName"] = owner
+        record["targetName"] = owner
+
+        if seconds < self.MIN_RECORD_SECONDS:
+            print(
+                f"[DB] SKIP TOO SHORT "
+                f"map=@{map_code} owner={owner} "
+                f"time={seconds:.3f}s "
+                f"minimum={self.MIN_RECORD_SECONDS:.3f}s"
             )
-        )
+            return None
+
+        if self.is_blacklisted(owner):
+            print(
+                f"[DB] SKIP BLACKLISTED "
+                f"map=@{map_code} owner={owner}"
+            )
+            return None
+
+        payload = json.dumps(record, separators=(",", ":"))
 
         with self.lock:
             best = self._best_exact_locked(
@@ -326,18 +402,13 @@ class RecordStore:
                 map_hash=map_hash,
             )
 
-            if (
-                best is not None
-                and seconds >= best["seconds"]
-            ):
+            if best is not None and seconds >= best["seconds"]:
                 print(
-                    f"[DB] BEST KEEP "
-                    f"map={map_code} "
+                    f"[DB] BEST KEEP map=@{map_code} "
                     f"best={best['seconds']:.3f}s "
-                    f"new={seconds:.3f}s "
-                    f"source={best['name']}"
+                    f"owner={best['name']} "
+                    f"candidate={owner} {seconds:.3f}s"
                 )
-
                 return None
 
             replaced = self._delete_exact_locked(
@@ -348,101 +419,40 @@ class RecordStore:
 
             cursor = self.db.execute(
                 """
-                INSERT INTO records (
-                    map_code,
-                    mirrored,
-                    map_hash,
-                    finish_ms,
-                    event_count,
-                    payload_json,
-                    life_timer_version
+                INSERT INTO records(
+                    map_code, mirrored, map_hash,
+                    finish_ms, event_count, payload_json,
+                    life_timer_version, owner_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     map_code,
                     int(mirrored),
                     map_hash,
                     float(record["finishMs"]),
-                    len(record["events"]),
+                    len(record.get("events", [])),
                     payload,
-                    life_timer_version,
+                    self.LIFE_TIMER_VERSION,
+                    owner,
                 ),
             )
-
             self.db.commit()
             record_id = int(cursor.lastrowid)
 
         print(
-            f"[DB] BEST OVERWRITE "
-            f"id={record_id} "
-            f"map={map_code} "
-            f"time={seconds:.3f}s "
-            f"source=SELF "
-            f"replacedRows={replaced}"
+            f"[DB] BEST OVERWRITE id={record_id} "
+            f"map=@{map_code} time={seconds:.3f}s "
+            f"owner={owner} replacedRows={replaced}"
         )
-
         return record_id
 
-    def get_best(
-        self,
-        *,
-        map_code,
-        mirrored,
-        map_hash,
-    ):
-        with self.lock:
-            row = self.db.execute(
-                """
-                SELECT
-                    id,
-                    payload_json
-                FROM records
-                WHERE map_code = ?
-                  AND mirrored = ?
-                  AND map_hash = ?
-                  AND life_timer_version = ?
-                ORDER BY finish_ms ASC
-                LIMIT 1
-                """,
-                (
-                    int(map_code),
-                    int(bool(mirrored)),
-                    str(map_hash),
-                    self.LIFE_TIMER_VERSION,
-                ),
-            ).fetchone()
+    def save_player_record(self, record):
+        record = dict(record)
 
-        if row is None:
-            return None
-
-        record = json.loads(
-            row["payload_json"]
-        )
-
-        record["id"] = int(
-            row["id"]
-        )
-
-        return record
-
-    def save_player_record(
-        self,
-        record,
-    ):
-        """
-        BEST-ONLY LEARNED PLAYER SAVE.
-
-        Only successful victory lives are eligible.
-        Competes directly against the saved SELF best.
-        """
-        if (
-            str(record.get("reason", ""))
-            != "victory"
-        ):
+        if str(record.get("reason", "")) != "victory":
             print(
-                "[DB] PLAYER SKIP "
-                f"reason={record.get('reason')}"
+                f"[DB] PLAYER SKIP reason={record.get('reason')}"
             )
             return None
 
@@ -450,18 +460,25 @@ class RecordStore:
         mirrored = bool(record["mirrored"])
         map_hash = str(record["mapHash"])
         seconds = float(record["victorySeconds"])
+        owner = str(record["targetName"])
 
-        payload = json.dumps(
-            record,
-            separators=(",", ":"),
-        )
-
-        life_timer_version = int(
-            record.get(
-                "lifeTimerVersion",
-                self.LIFE_TIMER_VERSION,
+        if seconds < self.MIN_RECORD_SECONDS:
+            print(
+                f"[DB] PLAYER SKIP TOO SHORT "
+                f"map=@{map_code} owner={owner} "
+                f"time={seconds:.3f}s "
+                f"minimum={self.MIN_RECORD_SECONDS:.3f}s"
             )
-        )
+            return None
+
+        if self.is_blacklisted(owner):
+            print(
+                f"[DB] PLAYER SKIP BLACKLISTED "
+                f"map=@{map_code} owner={owner}"
+            )
+            return None
+
+        payload = json.dumps(record, separators=(",", ":"))
 
         with self.lock:
             best = self._best_exact_locked(
@@ -470,18 +487,13 @@ class RecordStore:
                 map_hash=map_hash,
             )
 
-            if (
-                best is not None
-                and seconds >= best["seconds"]
-            ):
+            if best is not None and seconds >= best["seconds"]:
                 print(
-                    f"[DB] BEST KEEP "
-                    f"map={map_code} "
+                    f"[DB] BEST KEEP map=@{map_code} "
                     f"best={best['seconds']:.3f}s "
-                    f"new={seconds:.3f}s "
-                    f"candidate={record['targetName']}"
+                    f"owner={best['name']} "
+                    f"candidate={owner} {seconds:.3f}s"
                 )
-
                 return None
 
             replaced = self._delete_exact_locked(
@@ -492,23 +504,16 @@ class RecordStore:
 
             cursor = self.db.execute(
                 """
-                INSERT INTO player_records (
-                    target_name,
-                    target_session_id,
-                    map_code,
-                    mirrored,
-                    map_hash,
-                    round_id,
-                    end_reason,
-                    victory_seconds,
-                    event_count,
-                    payload_json,
-                    life_timer_version
+                INSERT INTO player_records(
+                    target_name, target_session_id,
+                    map_code, mirrored, map_hash, round_id,
+                    end_reason, victory_seconds, event_count,
+                    payload_json, life_timer_version
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    str(record["targetName"]),
+                    owner,
                     (
                         None
                         if record.get("targetSessionId") is None
@@ -526,23 +531,54 @@ class RecordStore:
                     seconds,
                     len(record.get("events", [])),
                     payload,
-                    life_timer_version,
+                    self.LIFE_TIMER_VERSION,
                 ),
             )
-
             self.db.commit()
             record_id = int(cursor.lastrowid)
 
         print(
-            f"[DB] BEST OVERWRITE "
-            f"id={record_id} "
-            f"map={map_code} "
-            f"time={seconds:.3f}s "
-            f"source={record['targetName']} "
-            f"replacedRows={replaced}"
+            f"[DB] BEST OVERWRITE id={record_id} "
+            f"map=@{map_code} time={seconds:.3f}s "
+            f"owner={owner} replacedRows={replaced}"
         )
-
         return record_id
+
+    def get_best(self, *, map_code, mirrored, map_hash):
+        with self.lock:
+            row = self.db.execute(
+                """
+                SELECT id, payload_json, owner_name
+                FROM records
+                WHERE map_code=?
+                  AND mirrored=?
+                  AND map_hash=?
+                  AND life_timer_version=?
+                  AND finish_ms >= ?
+                  AND NOT EXISTS(
+                    SELECT 1 FROM blacklist b
+                    WHERE b.name_key=lower(records.owner_name)
+                  )
+                ORDER BY finish_ms ASC
+                LIMIT 1
+                """,
+                (
+                    int(map_code),
+                    int(bool(mirrored)),
+                    str(map_hash),
+                    self.LIFE_TIMER_VERSION,
+                    self.MIN_RECORD_SECONDS * 1000.0,
+                ),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        record = json.loads(row["payload_json"])
+        record["id"] = int(row["id"])
+        record.setdefault("ownerName", str(row["owner_name"] or "SELF"))
+        record.setdefault("targetName", record["ownerName"])
+        return record
 
     def get_best_player_record(
         self,
@@ -552,26 +588,21 @@ class RecordStore:
         mirrored,
         map_hash,
     ):
-        """
-        Used only by explicit /playplayer Nick.
+        if self.is_blacklisted(target_name):
+            return None
 
-        With BEST-only global storage this succeeds only if that player's
-        route is currently the global best for this exact map key.
-        """
         with self.lock:
             row = self.db.execute(
                 """
-                SELECT
-                    id,
-                    payload_json
+                SELECT id, payload_json
                 FROM player_records
-                WHERE lower(target_name) = lower(?)
-                  AND map_code = ?
-                  AND mirrored = ?
-                  AND map_hash = ?
-                  AND end_reason = 'victory'
-                  AND life_timer_version = ?
-                  AND victory_seconds IS NOT NULL
+                WHERE lower(target_name)=lower(?)
+                  AND map_code=?
+                  AND mirrored=?
+                  AND map_hash=?
+                  AND end_reason='victory'
+                  AND life_timer_version=?
+                  AND victory_seconds >= ?
                 ORDER BY victory_seconds ASC
                 LIMIT 1
                 """,
@@ -581,25 +612,18 @@ class RecordStore:
                     int(bool(mirrored)),
                     str(map_hash),
                     self.LIFE_TIMER_VERSION,
+                    self.MIN_RECORD_SECONDS,
                 ),
             ).fetchone()
 
         if row is None:
             return None
 
-        record = json.loads(
-            row["payload_json"]
-        )
+        record = json.loads(row["payload_json"])
         record["id"] = int(row["id"])
         return record
 
-    def get_best_any_route(
-        self,
-        *,
-        map_code,
-        mirrored,
-        map_hash,
-    ):
+    def get_best_any_route(self, *, map_code, mirrored, map_hash):
         with self.lock:
             best = self._best_exact_locked(
                 map_code=map_code,
@@ -608,85 +632,77 @@ class RecordStore:
             )
 
         if best is None:
-            print(
-                f"[DB] BEST MISS map={map_code}"
-            )
+            print(f"[DB] BEST MISS map=@{int(map_code)}")
             return None
 
-        record = json.loads(
-            best["payload_json"]
-        )
+        record = json.loads(best["payload_json"])
         record["id"] = best["id"]
+        record.setdefault("targetName", best["name"])
+        record.setdefault("ownerName", best["name"])
 
         print(
-            f"[DB] BEST HIT "
-            f"map={map_code} "
+            f"[DB] BEST HIT map=@{int(map_code)} "
             f"time={best['seconds']:.3f}s "
-            f"source={best['name']} "
-            f"points={best['points']}"
+            f"owner={best['name']} points={best['points']}"
         )
-
         return record
 
-    def get_time_best(
-        self,
-        *,
-        map_code,
-    ):
-        """
-        User-facing lookup by map code.
-
-        There can technically be separate exact route variants
-        (different mapHash/mirrored). Return only the single fastest one.
-        """
+    def get_time_best(self, *, map_code):
         items = []
 
         with self.lock:
             own_rows = self.db.execute(
                 """
                 SELECT
-                    id,
+                    id, owner_name,
                     finish_ms / 1000.0 AS seconds,
-                    event_count,
-                    payload_json
+                    event_count, payload_json
                 FROM records
-                WHERE map_code = ?
-                  AND life_timer_version = ?
+                WHERE map_code=?
+                  AND life_timer_version=?
+                  AND finish_ms >= ?
+                  AND NOT EXISTS(
+                    SELECT 1 FROM blacklist b
+                    WHERE b.name_key=lower(records.owner_name)
+                  )
                 """,
                 (
                     int(map_code),
                     self.LIFE_TIMER_VERSION,
+                    self.MIN_RECORD_SECONDS * 1000.0,
                 ),
             ).fetchall()
 
             player_rows = self.db.execute(
                 """
                 SELECT
-                    id,
-                    target_name,
+                    id, target_name,
                     victory_seconds AS seconds,
-                    event_count,
-                    payload_json
+                    event_count, payload_json
                 FROM player_records
-                WHERE map_code = ?
-                  AND end_reason = 'victory'
-                  AND life_timer_version = ?
-                  AND victory_seconds IS NOT NULL
+                WHERE map_code=?
+                  AND end_reason='victory'
+                  AND life_timer_version=?
+                  AND victory_seconds >= ?
+                  AND NOT EXISTS(
+                    SELECT 1 FROM blacklist b
+                    WHERE b.name_key=lower(player_records.target_name)
+                  )
                 """,
                 (
                     int(map_code),
                     self.LIFE_TIMER_VERSION,
+                    self.MIN_RECORD_SECONDS,
                 ),
             ).fetchall()
 
         for row in own_rows:
             payload = json.loads(row["payload_json"])
-
             items.append(
                 {
                     "source": "SELF",
                     "id": int(row["id"]),
-                    "name": "SELF",
+                    "name": str(row["owner_name"] or "SELF"),
                     "seconds": float(row["seconds"]),
                     "points": int(row["event_count"]),
                     "mirrored": bool(payload.get("mirrored", False)),
@@ -696,7 +712,6 @@ class RecordStore:
 
         for row in player_rows:
             payload = json.loads(row["payload_json"])
-
             items.append(
                 {
                     "source": "PLAYER",
@@ -719,105 +734,178 @@ class RecordStore:
                 item["id"],
             )
         )
-
         return items[0]
 
-    def delete_map(
-        self,
-        *,
-        map_code,
-    ):
-        """
-        Delete every saved self/player route for one map code,
-        including old lifecycle versions and alternate variants.
-        """
-        with self.lock:
-            own = self.db.execute(
-                """
-                DELETE FROM records
-                WHERE map_code = ?
-                """,
-                (int(map_code),),
-            ).rowcount
+    def set_best_owner(self, *, map_code, new_owner):
+        new_owner = str(new_owner).strip()
 
-            player = self.db.execute(
-                """
-                DELETE FROM player_records
-                WHERE map_code = ?
-                """,
-                (int(map_code),),
-            ).rowcount
+        if not new_owner:
+            return {"ok": False, "reason": "empty-owner"}
+
+        if self.is_blacklisted(new_owner):
+            return {"ok": False, "reason": "owner-blacklisted"}
+
+        best = self.get_time_best(map_code=map_code)
+        if best is None:
+            return {"ok": False, "reason": "no-record"}
+
+        with self.lock:
+            if best["source"] == "SELF":
+                row = self.db.execute(
+                    "SELECT payload_json FROM records WHERE id=?",
+                    (best["id"],),
+                ).fetchone()
+
+                payload = json.loads(row["payload_json"])
+                payload["ownerName"] = new_owner
+                payload["targetName"] = new_owner
+
+                self.db.execute(
+                    """
+                    UPDATE records
+                    SET owner_name=?, payload_json=?
+                    WHERE id=?
+                    """,
+                    (
+                        new_owner,
+                        json.dumps(payload, separators=(",", ":")),
+                        best["id"],
+                    ),
+                )
+            else:
+                row = self.db.execute(
+                    "SELECT payload_json FROM player_records WHERE id=?",
+                    (best["id"],),
+                ).fetchone()
+
+                payload = json.loads(row["payload_json"])
+                payload["targetName"] = new_owner
+
+                self.db.execute(
+                    """
+                    UPDATE player_records
+                    SET target_name=?, payload_json=?
+                    WHERE id=?
+                    """,
+                    (
+                        new_owner,
+                        json.dumps(payload, separators=(",", ":")),
+                        best["id"],
+                    ),
+                )
 
             self.db.commit()
 
-        deleted = (
-            int(own or 0)
-            + int(player or 0)
-        )
-
         print(
-            f"[DB] DELETE MAP "
-            f"@{int(map_code)} "
-            f"rows={deleted}"
+            f"[DB] OWNER CHANGE map=@{int(map_code)} "
+            f"{best['name']} -> {new_owner}"
         )
 
+        return {
+            "ok": True,
+            "oldOwner": best["name"],
+            "newOwner": new_owner,
+            "seconds": best["seconds"],
+        }
+
+    def delete_map(self, *, map_code):
+        with self.lock:
+            a = self.db.execute(
+                "DELETE FROM records WHERE map_code=?",
+                (int(map_code),),
+            ).rowcount
+            b = self.db.execute(
+                "DELETE FROM player_records WHERE map_code=?",
+                (int(map_code),),
+            ).rowcount
+            self.db.commit()
+
+        deleted = int(a or 0) + int(b or 0)
+        print(f"[DB] DELETE MAP @{int(map_code)} rows={deleted}")
         return deleted
 
     def delete_all(self):
-        """
-        Delete ALL route records from both tables.
-        """
         with self.lock:
-            own = self.db.execute(
-                "DELETE FROM records"
-            ).rowcount
-
-            player = self.db.execute(
-                "DELETE FROM player_records"
-            ).rowcount
-
+            a = self.db.execute("DELETE FROM records").rowcount
+            b = self.db.execute("DELETE FROM player_records").rowcount
             self.db.commit()
 
-        deleted = (
-            int(own or 0)
-            + int(player or 0)
-        )
-
-        print(
-            f"[DB] DELETE ALL rows={deleted}"
-        )
-
+        deleted = int(a or 0) + int(b or 0)
+        print(f"[DB] DELETE ALL rows={deleted}")
         return deleted
 
     def compact_best_records(self):
         """
-        Migrate an existing V1.10 DB to V1.11 BEST-only semantics.
-
-        For each exact clean lifecycle-v3 route key:
-            retain only the fastest row across BOTH tables.
-
-        Old lifecycle rows remain untouched until /timedelete is used,
-        because autoplay already ignores them.
+        Convert the existing DB to the current rules:
+          - drop old lifecycle generations
+          - drop <11s records
+          - drop blacklisted owners
+          - one best row per exact map identity
         """
         with self.lock:
+            removed = 0
+
+            removed += int(
+                self.db.execute(
+                    "DELETE FROM records WHERE life_timer_version != ?",
+                    (self.LIFE_TIMER_VERSION,),
+                ).rowcount or 0
+            )
+            removed += int(
+                self.db.execute(
+                    "DELETE FROM player_records WHERE life_timer_version != ?",
+                    (self.LIFE_TIMER_VERSION,),
+                ).rowcount or 0
+            )
+
+            removed += int(
+                self.db.execute(
+                    "DELETE FROM records WHERE finish_ms < ?",
+                    (self.MIN_RECORD_SECONDS * 1000.0,),
+                ).rowcount or 0
+            )
+            removed += int(
+                self.db.execute(
+                    """
+                    DELETE FROM player_records
+                    WHERE victory_seconds IS NULL
+                       OR victory_seconds < ?
+                       OR end_reason != 'victory'
+                    """,
+                    (self.MIN_RECORD_SECONDS,),
+                ).rowcount or 0
+            )
+
+            removed += int(
+                self.db.execute(
+                    """
+                    DELETE FROM records
+                    WHERE EXISTS(
+                        SELECT 1 FROM blacklist b
+                        WHERE b.name_key=lower(records.owner_name)
+                    )
+                    """
+                ).rowcount or 0
+            )
+            removed += int(
+                self.db.execute(
+                    """
+                    DELETE FROM player_records
+                    WHERE EXISTS(
+                        SELECT 1 FROM blacklist b
+                        WHERE b.name_key=lower(player_records.target_name)
+                    )
+                    """
+                ).rowcount or 0
+            )
+
             keys = self.db.execute(
                 """
-                SELECT map_code, mirrored, map_hash
-                FROM records
-                WHERE life_timer_version = ?
+                SELECT map_code, mirrored, map_hash FROM records
                 UNION
-                SELECT map_code, mirrored, map_hash
-                FROM player_records
-                WHERE life_timer_version = ?
-                  AND end_reason = 'victory'
-                """,
-                (
-                    self.LIFE_TIMER_VERSION,
-                    self.LIFE_TIMER_VERSION,
-                ),
+                SELECT map_code, mirrored, map_hash FROM player_records
+                """
             ).fetchall()
-
-            removed = 0
 
             for key in keys:
                 map_code = int(key["map_code"])
@@ -829,7 +917,6 @@ class RecordStore:
                     mirrored=mirrored,
                     map_hash=map_hash,
                 )
-
                 if best is None:
                     continue
 
@@ -838,88 +925,43 @@ class RecordStore:
                         self.db.execute(
                             """
                             DELETE FROM records
-                            WHERE map_code = ?
-                              AND mirrored = ?
-                              AND map_hash = ?
-                              AND life_timer_version = ?
-                              AND id != ?
+                            WHERE map_code=? AND mirrored=? AND map_hash=? AND id != ?
                             """,
-                            (
-                                map_code,
-                                mirrored,
-                                map_hash,
-                                self.LIFE_TIMER_VERSION,
-                                best["id"],
-                            ),
-                        ).rowcount
-                        or 0
+                            (map_code, mirrored, map_hash, best["id"]),
+                        ).rowcount or 0
                     )
-
                     removed += int(
                         self.db.execute(
                             """
                             DELETE FROM player_records
-                            WHERE map_code = ?
-                              AND mirrored = ?
-                              AND map_hash = ?
-                              AND life_timer_version = ?
+                            WHERE map_code=? AND mirrored=? AND map_hash=?
                             """,
-                            (
-                                map_code,
-                                mirrored,
-                                map_hash,
-                                self.LIFE_TIMER_VERSION,
-                            ),
-                        ).rowcount
-                        or 0
+                            (map_code, mirrored, map_hash),
+                        ).rowcount or 0
                     )
-
                 else:
                     removed += int(
                         self.db.execute(
                             """
                             DELETE FROM player_records
-                            WHERE map_code = ?
-                              AND mirrored = ?
-                              AND map_hash = ?
-                              AND life_timer_version = ?
-                              AND id != ?
+                            WHERE map_code=? AND mirrored=? AND map_hash=? AND id != ?
                             """,
-                            (
-                                map_code,
-                                mirrored,
-                                map_hash,
-                                self.LIFE_TIMER_VERSION,
-                                best["id"],
-                            ),
-                        ).rowcount
-                        or 0
+                            (map_code, mirrored, map_hash, best["id"]),
+                        ).rowcount or 0
                     )
-
                     removed += int(
                         self.db.execute(
                             """
                             DELETE FROM records
-                            WHERE map_code = ?
-                              AND mirrored = ?
-                              AND map_hash = ?
-                              AND life_timer_version = ?
+                            WHERE map_code=? AND mirrored=? AND map_hash=?
                             """,
-                            (
-                                map_code,
-                                mirrored,
-                                map_hash,
-                                self.LIFE_TIMER_VERSION,
-                            ),
-                        ).rowcount
-                        or 0
+                            (map_code, mirrored, map_hash),
+                        ).rowcount or 0
                     )
 
             self.db.commit()
 
         if removed:
-            print(
-                f"[DB] BEST COMPACT removedRows={removed}"
-            )
+            print(f"[DB] COMPACT removedRows={removed}")
 
         return removed

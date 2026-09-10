@@ -1,147 +1,219 @@
-TFM V1.11 - BEST ONLY
-=====================
+emirhankarakoc v1.2
+===================
 
-CORE RULE
----------
+CHAT PREFIX
+-----------
 
-For one exact replay-compatible route key:
+All proxy-generated in-game messages use:
+
+    [emirhankarakoc v1.2]
+
+The old [V1.xx] prefix is gone.
+
+
+ROUND-START RECORD DISPLAY
+--------------------------
+
+Every NewRound checks the current exact map identity.
+
+If a usable BEST exists:
+
+    ROUND @7680000 | BEST 17.486s | owner=Armagan#1300 | 57 points
+
+If none exists:
+
+    ROUND @7680000 | NO SAVED RUN
+
+
+FIRST PLACE LOGGING
+-------------------
+
+Example:
+
+    FIRST PLACE learned | @7680000 | Popmie#1793 | 32.270s | 86 points
+
+Map code is included in terminal and in-game logs.
+
+
+BEST-ONLY STORAGE
+-----------------
+
+Only one BEST route exists per exact:
 
     mapCode + mirrored + mapHash
 
-V1.11 keeps ONLY ONE record total.
-
-SELF and learned PLAYER/WINNER records compete against each other.
-
-
-NEW RESULT
-----------
-
-No record:
-    new successful run is saved
-
-New run is faster:
-    previous SELF/PLAYER record is deleted
-    new run becomes the only BEST
-
-New run is slower or equal:
-    it is NOT saved
-    existing BEST stays untouched
+A faster SELF or learned PLAYER route overwrites the old route.
+A slower/equal route is ignored.
 
 
-EXAMPLES
---------
+MINIMUM TIME
+------------
 
-Existing:
-    Pedro#4565 17.486s
+Any route shorter than:
 
-New SELF:
-    16.750s
+    11.000 seconds
 
-Result:
-    Pedro row deleted
-    SELF 16.750s is the only stored clean route
+is rejected and never becomes replay data.
 
 
-Existing:
-    SELF 16.750s
+OWNER
+-----
 
-New winner:
-    Pedro#4565 17.200s
+New SELF records are tagged with the logged-in player name.
 
-Result:
-    new Pedro run is ignored
-    SELF 16.750s remains
+Change the owner label of a map's current BEST:
 
-
-OLD V1.10 DUPLICATES
---------------------
-
-On startup V1.11 automatically compacts existing lifecycle-v3 data.
-
-For every exact map route key it retains only the fastest row across:
-
-    records
-    player_records
+    /timeowner @7680000 Nick#0000
 
 
-TIMELIST
---------
+BLACKLIST
+---------
 
-Current map:
+Add:
+
+    /blacklist add Nick#0000
+
+Shortcut:
+
+    /blacklist Nick#0000
+
+Remove:
+
+    /blacklist remove Nick#0000
+
+Show:
+
+    /blacklist list
+
+Clear:
+
+    /blacklist clear
+
+Adding somebody to the blacklist immediately deletes records currently
+owned by that name. Future runs from the blacklisted owner are ignored.
+
+
+REPLAY TERMINAL LOGGING
+-----------------------
+
+Every movement sent by the replay prints its packet class and state:
+
+    [TX->SERVER] packet=PlayerMovementPacket ...
+
+Local mirror packets are also logged:
+
+    [TX->CLIENT] packet=MovePlayerPacket ...
+    [TX->CLIENT] packet=SetFacingPacket ...
+
+
+VICTORY / LAST HELD MOVEMENT FIX
+--------------------------------
+
+If victory happens while LEFT/RIGHT/JUMP state is still held, there may be
+no final release packet.
+
+Successful recordings now append a terminalHold checkpoint at the exact
+victory timestamp using the last movement state.
+
+Replay also sends four short 50ms terminal-grace repeats while waiting for
+server victory.
+
+This prevents sparse recordings from ending one movement packet before the
+hole recognition.
+
+
+AFK FARMING
+-----------
+
+Enable:
+
+    /afkfarming on
+
+Disable:
+
+    /afkfarming off
+
+When ON:
+
+1. If a saved route already exists at round start:
+       PLAY is enabled and the route is used.
+
+2. If no route exists:
+       system waits for the first eligible winner route
+       and schedules two jump pulses from the first usable self movement
+       packet so the client does not remain completely idle.
+
+3. When an eligible first-place route is learned:
+       PLAY is enabled automatically
+       the learned route is armed
+       if we are still alive it starts immediately in the SAME hand.
+
+Blacklisted winners and records shorter than 11 seconds are not used.
+
+
+TIME COMMANDS
+-------------
+
+Show current map BEST:
 
     /timelist
 
-Specific map:
+Show another map:
 
     /timelist @7680000
-
-Output is ONE line only:
-
-    [V1.11] BEST @7680000 | 16.750s | SELF | R#12 | 57 pts
-
-or:
-
-    [V1.11] BEST @7680000 | 14.921s | Pedro#4565 | P#8 | 63 pts
-
-
-DELETE
-------
 
 Delete current map:
 
     /timedelete
 
-Delete a specific map code:
+Delete map:
 
     /timedelete @7680000
 
-This removes both:
-    SELF records
-    PLAYER/winner records
-
-for that map code, including alternate hash/mirrored variants.
-
-
-Delete EVERYTHING:
+Delete all route data:
 
     /timedelete all
 
 
-PERSISTENT PLAY AFTER DELETE
-----------------------------
+MAIN MODES
+----------
 
-If PLAY is ON and you delete the current map's BEST:
+    /record on
+    /record off
 
-    active replay is stopped
-    route is removed
-    current map becomes "no route"
+    /play on
+    /play off
 
-Then normal autolearn behavior applies:
-    play manually
-    record new successful run
-    learn a winner if another player is faster
+    /recordplayer Nick#0000
+    /recordplayer off
+
+    /playplayer Nick#0000
+    /playplayer off
+
+    /afkfarming on
+    /afkfarming off
+
+    /help
 
 
-COMMANDS
---------
+V1.2 FIXES
+==========
 
-/help
+AFKFARMING JUMPS:
+    first jump  = 5.00s after LIFE/Alive start
+    second jump = 5.75s after LIFE/Alive start
 
-/record on
-/record off
+FINAL MOVEMENT:
+    victory opens a 150ms post-victory movement capture window
+    final real serverbound movement packets are still accepted
+    newest real movement state is clamped to exact victory timestamp
+    saved run duration does NOT include the extra 150ms
 
-/play on
-/play off
+Expected terminal diagnostics:
+    [VICTORY CAPTURE] ... 150ms final-movement window OPEN
+    [REC POST-VICTORY MOVEMENT] ...
+    [RECORD FINAL SNAPSHOT] ... postVictoryPackets=N
+    [RECORD FINALIZED] ...
 
-/recordplayer Nick#0000
-/recordplayer off
-
-/playplayer Nick#0000
-/playplayer off
-
-/timelist
-/timelist @mapCode
-
-/timedelete
-/timedelete @mapCode
-/timedelete all
+Replay terminal grace:
+    6 repeats x 40ms

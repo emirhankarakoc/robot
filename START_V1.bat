@@ -1,26 +1,25 @@
 @echo off
 cd /d "%~dp0"
 
-title TFM V1.11 - SIMPLE RECORD PLAY
+title emirhankarakoc v1.2
 
-echo ==========================================
-echo  TFM V1.11 - RESPAWN-SAFE RECORD / SERVER PLAY / AUTOLEARN
-echo ==========================================
+echo ==============================================================
+echo  emirhankarakoc v1.2 - RECORD / RACING / AUTOLEARN
+echo ==============================================================
 echo.
 echo Commands:
 echo   /help
+echo   /record on ^| off
+echo   /play on ^| off
+echo   /afkfarming on ^| off
+echo   /recordplayer Nick#0000 ^| off
+echo   /playplayer Nick#0000 ^| off
 echo   /timelist [@mapCode]
 echo   /timedelete [@mapCode^|all]
-echo   /record on
-echo   /record off
-echo   /play on
-echo   /play off
-echo   /recordplayer Nick#0000
-echo   /recordplayer off
-echo   /playplayer Nick#0000
-echo   /playplayer off
+echo   /timeowner @mapCode Nick#0000
+echo   /blacklist add/remove/list/clear [Nick#0000]
 echo.
-echo No API. No 8787. One Python process.
+echo BEST only. Minimum record time: 11.000 seconds.
 echo.
 
 py -3.11 main.py
