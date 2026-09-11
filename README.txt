@@ -1,4 +1,4 @@
-emirhankarakoc v1.10
+emirhankarakoc v1.15
 ===================
 
 CHAT PREFIX
@@ -6,7 +6,7 @@ CHAT PREFIX
 
 All proxy-generated in-game messages use:
 
-    [emirhankarakoc v1.10]
+    [emirhankarakoc v1.15]
 
 The old [V1.xx] prefix is gone.
 
@@ -495,3 +495,216 @@ Important lifecycle / result logs stay visible:
 
 This changes logging only. Packet timing, replay data, recording,
 backend forwarding and local mirroring are unchanged.
+
+
+V1.11 - PAKETYOLLA TEST
+=======================
+
+Command:
+
+    /paketyolla Nick#0000
+
+Leading dot is also accepted by the existing command parser:
+
+    ./paketyolla Nick#0000
+
+Behavior:
+
+    - sends ONE serverbound CommandPacket
+    - command format: w Nick#0000 <payload>
+    - private-message payload BODY = exactly 1024 ASCII bytes
+    - no repeat loop
+    - 1 second cooldown between manual invocations
+
+Terminal:
+
+    [PAKETYOLLA] target=Nick#0000 payloadBytes=1024 count=1
+
+Important:
+    This relies on the configured backend supporting the normal "w" private
+    message command and routing it to the named connected client.
+
+    The 1024-byte BODY is exact. The serialized network packet is a little
+    larger because command text, nickname, string length/framing and packet
+    headers are also present.
+
+
+V1.12 - SAFE SERVER PACKET LOAD TEST
+====================================
+
+Command:
+
+    /svpaketyolla 25
+
+Also accepted by the existing parser:
+
+    ./svpaketyolla 25
+
+Guardrails:
+
+    minimum: 1 packet
+    maximum: 100 packets per run
+    fixed rate: 10 packets / second
+    only one test can run at a time
+    no burst mode
+    no infinite loop
+
+Each packet is a small serverbound CommandPacket:
+
+    svloadtest 1/25
+    svloadtest 2/25
+    ...
+
+The backend may ignore the unknown command, but it still exercises
+packet framing, decoding, and command dispatch.
+
+Examples:
+
+    /svpaketyolla 10
+        ~1 second bounded test
+
+    /svpaketyolla 50
+        ~5 second bounded test
+
+    /svpaketyolla 999
+        automatically capped to 100
+
+Terminal:
+
+    [SVPAKETYOLLA] START count=50 rate=10/s
+    [SVPAKETYOLLA] DONE sent=50 rateLimit=10/s
+
+
+V1.13 - HOLE/SPAWN GEOMETRY REPLAY
+==================================
+
+NewRoundPacket itself carries map XML. This version parses that XML and uses:
+
+    <T X="..." Y="..." />    = mouse hole
+    <DS X="..." Y="..." />   = mouse spawn
+    <P DS="m;x,y,..." />      = multiple exact mouse spawns
+    <P L="..." H="..." />    = map width / height
+
+Important:
+
+    PlayerVictoryPacket does NOT expose x/y in the current Caseus definition.
+    Victory provides the finishing session/time/place. For learned remote runs,
+    the final real PlayerMovementPacket is matched to the nearest parsed <T>
+    so the route knows which exact hole it was approaching.
+
+Mirrored maps:
+
+    effectiveX = mapWidth - rawXmlX
+
+Route metadata added automatically:
+
+    mapGeometry
+    recordedSpawn
+    targetHole
+    routeFirstPoint
+    routeLastRealPoint
+
+Existing database routes are compatible. When an old route is loaded, v1.13
+recomputes geometry metadata from the active NewRound XML in memory.
+
+REPLAY START
+------------
+
+The first current self movement is compared with exact XML spawn points.
+If the current and recorded route resolve to different concrete spawns, the
+route is translated by the exact spawn delta. Arbitrary mid-map positions are
+not used as an offset.
+
+REPLAY FINISH
+-------------
+
+The old blind LEFT/RIGHT finish-drive is removed.
+
+After the final REAL recorded checkpoint:
+
+  1. The exact route target hole is already known from <T X,Y>.
+  2. Natural server physics gets a 120 ms grace window.
+  3. If victory has not arrived and the final checkpoint is within 180 px of
+     the hole, a short 3-8 checkpoint X+Y guided segment approaches the exact
+     hole coordinate.
+  4. If the route end is farther than 180 px, no synthetic finish is sent.
+
+This is intentionally distance-bounded so a bad/mismatched route cannot make
+an uncontrolled cross-map correction.
+
+NEW COMMAND
+-----------
+
+    /geometry
+
+Shows current parsed map size, mirrored state, hole coordinates and exact
+spawn coordinates in local proxy chat.
+
+Useful terminal lines:
+
+    [MAP GEOMETRY] width=800 height=400 holes=1 spawns=1 ...
+    [HOLE] index=0 x=... y=...
+    [SPAWN] index=0 x=... y=...
+    [VICTORY GEOMETRY] session=... last=(x,y) hole=(x,y) distance=...
+    [ROUTE SPAWN] ...
+    [ROUTE HOLE] ...
+    [SPAWN ALIGN] ...
+    [HOLE GUIDE] last=(x,y) target=(x,y) delta=(x,y) distance=...
+
+
+V1.14 - NO TELEPORT HOLE FINISH + VICTORY LATCH
+=================================================
+
+Changes from v1.13:
+
+1) Removed geometry-driven synthetic movement.
+
+   v1.13 could emit 3-8 interpolated absolute x/y packets from the last
+   recorded point to <T X,Y>. That looked like a teleport and bypassed
+   natural map physics.
+
+   v1.14 sends ZERO hole-assist movement packets.
+   Hole coordinates are diagnostics only.
+
+   Expected end log:
+
+       [PLAY END] last REAL checkpoint sent | ...
+       [HOLE OBSERVE] last=(...) hole=(...) delta=(...) distance=... syntheticPackets=0
+       [HOLE OBSERVE] natural coast only; hole geometry will not modify x/y
+       [PLAY] trajectory complete; waiting for victory/death
+
+2) Server victory is latched for the rest of the round.
+
+   Some rooms emit a player-update Alive after victory. v1.13 interpreted
+   that as a new life and replayed the same route repeatedly in one round.
+   v1.14 blocks replay restart until the next NewRound.
+
+       [PLAY] victory latched map=@... round=...; restart blocked until NewRound
+       [PLAY] restart suppressed after victory ...
+
+3) NewRound clears the victory latch normally.
+
+The parsed <T> hole and spawn geometry remains available through /geometry.
+
+
+V1.15 - CLIENT PHYSICS TAIL HANDOFF
+===================================
+
+Root cause fixed:
+V1.14 kept Replayer.active=True after the final saved checkpoint.
+That caused proxy_core to block the local client's own movement packets,
+so "natural coast" never reached the backend.
+
+V1.15 behavior:
+- recorded trajectory packets are injected exactly as before
+- at the final REAL checkpoint, injection ends
+- Replayer.active becomes False
+- waitingForFinish stays True to prevent accidental route restart
+- real local PlayerMovementPacket packets are allowed through normally
+- victory/death/new-round clears the waiting latch
+- hole XML remains diagnostic only; no hole coordinate is injected
+
+Expected end log:
+[PLAY] trajectory complete; CLIENT PHYSICS HANDOFF active=False waitingForFinish=True
+[TAIL PASSTHROUGH] CLIENT -> SERVER physics resumed | x=... y=...
+[VICTORY] SERVER time=...
