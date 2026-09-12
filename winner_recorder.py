@@ -82,6 +82,20 @@ class WinnerRecorder:
             f"map={map_code} round={round_id}"
         )
 
+    def invalidate_round(self, reason="room-change"):
+        """Discard observations that are not tied to a verified NewRound."""
+        self.map_context = None
+        self.alive_by_session = {}
+        self.anchor_by_session = {}
+        self.events_by_session = {}
+        self.facing_by_session = {}
+        self.life_index_by_session = {}
+        self.last_alive_signal_by_session = {}
+
+        print(
+            f"[WINNER RECORDER] ROUND INVALID reason={reason}"
+        )
+
     def register_player(
         self,
         session_id,

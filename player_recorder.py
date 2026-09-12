@@ -104,6 +104,24 @@ class PlayerRecorder:
                 f"[PLAYER RECORDER] OFF target={old}"
             )
 
+    def invalidate_round(self, reason="room-change"):
+        """Keep the selected nickname but discard all stale round state."""
+        with self.lock:
+            target = self.target_name
+            self.target_session_id = None
+            self.map_context = None
+            self.alive = False
+            self.anchor_ns = None
+            self.events = []
+            self.facing_right = True
+            self.last_alive_signal_ns = None
+
+        if target is not None:
+            print(
+                f"[PLAYER RECORDER] ROUND INVALID "
+                f"target={target} reason={reason}"
+            )
+
     def set_session(self, session_id):
         with self.lock:
             if self.target_name is None:

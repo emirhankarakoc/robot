@@ -381,6 +381,8 @@ class RecordStore:
             print(
                 f"[DB] SKIP TOO SHORT "
                 f"map=@{map_code} owner={owner} "
+                f"mirrored={'YES' if mirrored else 'NO'} "
+                f"hash={map_hash[:12]} "
                 f"time={seconds:.3f}s "
                 f"minimum={self.MIN_RECORD_SECONDS:.3f}s"
             )
@@ -389,7 +391,9 @@ class RecordStore:
         if self.is_blacklisted(owner):
             print(
                 f"[DB] SKIP BLACKLISTED "
-                f"map=@{map_code} owner={owner}"
+                f"map=@{map_code} owner={owner} "
+                f"mirrored={'YES' if mirrored else 'NO'} "
+                f"hash={map_hash[:12]}"
             )
             return None
 
@@ -405,6 +409,8 @@ class RecordStore:
             if best is not None and seconds >= best["seconds"]:
                 print(
                     f"[DB] BEST KEEP map=@{map_code} "
+                    f"mirrored={'YES' if mirrored else 'NO'} "
+                    f"hash={map_hash[:12]} "
                     f"best={best['seconds']:.3f}s "
                     f"owner={best['name']} "
                     f"candidate={owner} {seconds:.3f}s"
@@ -442,7 +448,10 @@ class RecordStore:
 
         print(
             f"[DB] BEST OVERWRITE id={record_id} "
-            f"map=@{map_code} time={seconds:.3f}s "
+            f"map=@{map_code} "
+            f"mirrored={'YES' if mirrored else 'NO'} "
+            f"hash={map_hash[:12]} "
+            f"time={seconds:.3f}s "
             f"owner={owner} replacedRows={replaced}"
         )
         return record_id
@@ -466,6 +475,8 @@ class RecordStore:
             print(
                 f"[DB] PLAYER SKIP TOO SHORT "
                 f"map=@{map_code} owner={owner} "
+                f"mirrored={'YES' if mirrored else 'NO'} "
+                f"hash={map_hash[:12]} "
                 f"time={seconds:.3f}s "
                 f"minimum={self.MIN_RECORD_SECONDS:.3f}s"
             )
@@ -474,7 +485,9 @@ class RecordStore:
         if self.is_blacklisted(owner):
             print(
                 f"[DB] PLAYER SKIP BLACKLISTED "
-                f"map=@{map_code} owner={owner}"
+                f"map=@{map_code} owner={owner} "
+                f"mirrored={'YES' if mirrored else 'NO'} "
+                f"hash={map_hash[:12]}"
             )
             return None
 
@@ -490,6 +503,8 @@ class RecordStore:
             if best is not None and seconds >= best["seconds"]:
                 print(
                     f"[DB] BEST KEEP map=@{map_code} "
+                    f"mirrored={'YES' if mirrored else 'NO'} "
+                    f"hash={map_hash[:12]} "
                     f"best={best['seconds']:.3f}s "
                     f"owner={best['name']} "
                     f"candidate={owner} {seconds:.3f}s"
@@ -539,7 +554,10 @@ class RecordStore:
 
         print(
             f"[DB] BEST OVERWRITE id={record_id} "
-            f"map=@{map_code} time={seconds:.3f}s "
+            f"map=@{map_code} "
+            f"mirrored={'YES' if mirrored else 'NO'} "
+            f"hash={map_hash[:12]} "
+            f"time={seconds:.3f}s "
             f"owner={owner} replacedRows={replaced}"
         )
         return record_id
@@ -576,6 +594,8 @@ class RecordStore:
 
         record = json.loads(row["payload_json"])
         record["id"] = int(row["id"])
+        record.setdefault("mirrored", bool(mirrored))
+        record.setdefault("mapHash", str(map_hash))
         record.setdefault("ownerName", str(row["owner_name"] or "SELF"))
         record.setdefault("targetName", record["ownerName"])
         return record
@@ -621,6 +641,8 @@ class RecordStore:
 
         record = json.loads(row["payload_json"])
         record["id"] = int(row["id"])
+        record.setdefault("mirrored", bool(mirrored))
+        record.setdefault("mapHash", str(map_hash))
         return record
 
     def get_best_any_route(self, *, map_code, mirrored, map_hash):
@@ -632,20 +654,120 @@ class RecordStore:
             )
 
         if best is None:
-            print(f"[DB] BEST MISS map=@{int(map_code)}")
+            print(
+                f"[DB] BEST MISS map=@{int(map_code)} "
+                f"mirrored={'YES' if bool(mirrored) else 'NO'} "
+                f"hash={str(map_hash)[:12]}"
+            )
             return None
 
         record = json.loads(best["payload_json"])
         record["id"] = best["id"]
+        record.setdefault("mirrored", bool(mirrored))
+        record.setdefault("mapHash", str(map_hash))
         record.setdefault("targetName", best["name"])
         record.setdefault("ownerName", best["name"])
 
         print(
             f"[DB] BEST HIT map=@{int(map_code)} "
+            f"mirrored={'YES' if bool(mirrored) else 'NO'} "
+            f"hash={str(map_hash)[:12]} "
             f"time={best['seconds']:.3f}s "
             f"owner={best['name']} points={best['points']}"
         )
         return record
+
+    @staticmethod
+    def _orientation_item(best):
+        if best is None:
+            return None
+
+        return {
+            "source": best["source"],
+            "id": int(best["id"]),
+            "name": str(best["name"]),
+            "seconds": float(best["seconds"]),
+            "points": int(best["points"]),
+        }
+
+    def get_orientation_status(self, *, map_code, map_hash):
+        """Return independent normal/mirrored BEST status for one exact XML."""
+        with self.lock:
+            normal = self._best_exact_locked(
+                map_code=map_code,
+                mirrored=False,
+                map_hash=map_hash,
+            )
+            mirrored = self._best_exact_locked(
+                map_code=map_code,
+                mirrored=True,
+                map_hash=map_hash,
+            )
+
+        return {
+            "mapCode": int(map_code),
+            "mapHash": str(map_hash),
+            "normal": self._orientation_item(normal),
+            "mirrored": self._orientation_item(mirrored),
+        }
+
+    def get_all_orientation_statuses(self, *, map_code=None):
+        """
+        Return every exact mapCode+mapHash with separate YES/NO orientation.
+
+        Missing counterparts remain None so logs can explicitly say KAYITSIZ.
+        """
+        parameters = ()
+        where = ""
+
+        if map_code is not None:
+            where = "WHERE map_code = ?"
+            parameters = (int(map_code),)
+
+        with self.lock:
+            keys = self.db.execute(
+                f"""
+                SELECT DISTINCT map_code, map_hash
+                FROM (
+                    SELECT map_code, map_hash FROM records
+                    UNION
+                    SELECT map_code, map_hash FROM player_records
+                )
+                {where}
+                ORDER BY map_code, map_hash
+                """,
+                parameters,
+            ).fetchall()
+
+            statuses = []
+
+            for key in keys:
+                code = int(key["map_code"])
+                map_hash_value = str(key["map_hash"])
+                normal = self._best_exact_locked(
+                    map_code=code,
+                    mirrored=False,
+                    map_hash=map_hash_value,
+                )
+                mirrored = self._best_exact_locked(
+                    map_code=code,
+                    mirrored=True,
+                    map_hash=map_hash_value,
+                )
+
+                if normal is None and mirrored is None:
+                    continue
+
+                statuses.append(
+                    {
+                        "mapCode": code,
+                        "mapHash": map_hash_value,
+                        "normal": self._orientation_item(normal),
+                        "mirrored": self._orientation_item(mirrored),
+                    }
+                )
+
+        return statuses
 
     def get_time_best(self, *, map_code):
         items = []
@@ -909,6 +1031,102 @@ class RecordStore:
         deleted = int(a or 0) + int(b or 0)
         print(f"[DB] DELETE MAP @{int(map_code)} rows={deleted}")
         return deleted
+
+    def delete_record(self, *, record_id, source=None):
+        """Delete one SELF/PLAYER row without confusing overlapping IDs."""
+        record_id = int(record_id)
+
+        if record_id <= 0:
+            return {
+                "ok": False,
+                "reason": "invalid-id",
+                "id": record_id,
+            }
+
+        if source is not None:
+            source = str(source).strip().upper()
+
+        table_specs = {
+            "SELF": "records",
+            "PLAYER": "player_records",
+        }
+
+        if source is not None and source not in table_specs:
+            return {
+                "ok": False,
+                "reason": "invalid-source",
+                "id": record_id,
+            }
+
+        sources = (
+            (source,)
+            if source is not None
+            else ("SELF", "PLAYER")
+        )
+
+        with self.lock:
+            matches = []
+
+            for source_name in sources:
+                table_name = table_specs[source_name]
+                row = self.db.execute(
+                    f"""
+                    SELECT id, map_code, mirrored, map_hash
+                    FROM {table_name}
+                    WHERE id=?
+                    """,
+                    (record_id,),
+                ).fetchone()
+
+                if row is not None:
+                    matches.append(
+                        {
+                            "source": source_name,
+                            "id": int(row["id"]),
+                            "mapCode": int(row["map_code"]),
+                            "mirrored": bool(row["mirrored"]),
+                            "mapHash": str(row["map_hash"]),
+                            "reference": f"{source_name}:{int(row['id'])}",
+                        }
+                    )
+
+            if not matches:
+                return {
+                    "ok": False,
+                    "reason": "not-found",
+                    "id": record_id,
+                }
+
+            if source is None and len(matches) > 1:
+                return {
+                    "ok": False,
+                    "reason": "ambiguous",
+                    "id": record_id,
+                    "matches": matches,
+                }
+
+            match = matches[0]
+            table_name = table_specs[match["source"]]
+            deleted = self.db.execute(
+                f"DELETE FROM {table_name} WHERE id=?",
+                (record_id,),
+            ).rowcount
+            self.db.commit()
+
+        deleted = int(deleted or 0)
+        print(
+            f"[DB] DELETE ID={match['reference']} "
+            f"map=@{match['mapCode']} "
+            f"mirrored={'YES' if match['mirrored'] else 'NO'} "
+            f"hash={match['mapHash'][:12]} rows={deleted}"
+        )
+
+        return {
+            "ok": deleted == 1,
+            "reason": "deleted" if deleted == 1 else "delete-failed",
+            "deleted": deleted,
+            **match,
+        }
 
     def delete_all(self):
         with self.lock:

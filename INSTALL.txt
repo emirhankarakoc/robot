@@ -1,6 +1,28 @@
 ROBOT HOTLINE + SISMANLAT
 ========================
 
+ROUND MATCH GUARD V8:
+    Proxy o roundun NewRoundPacket bilgisini gormediyse kayit alinmaz.
+    SELF victory icin EnterHolePacket mapCode+roundId degeri NewRoundPacket ile
+    birebir eslesmelidir. Eslesmezse NON-NORMAL RUN SKIP yazip DB'ye kaydetmez.
+    Odaya girerken onceki map/round context'i tamamen gecersiz kilinir.
+
+RECORD ID DELETE V7:
+    /timelist satirinin en sonunda ID=SELF:12 veya ID=PLAYER:7 yazar.
+    /timedelete ID yalniz o exact kaydi siler.
+
+MIRRORED PLAYBACK:
+    Ayni yon kaydi varsa once o kullanilir.
+    Ayni yon kaydi yoksa ters yon kaydi otomatik aynalanarak oynatilir.
+    Kaydedilmis asil veri degistirilmez.
+
+MIRRORED LOG ENVANTERI:
+    Her yeni mapte MIRRORED=NO ve MIRRORED=YES ayri KAYITLI/KAYITSIZ yazilir.
+    /timelist ve /timelist @mapCode iki yonu ayri satirlarda gosterir.
+    Kayitli satirin sonunda ID=SELF:12 veya ID=PLAYER:7 bulunur.
+    Tek kayit silme: /timedelete SELF:12 veya /timedelete PLAYER:7
+    Yalniz bir tabloda varsa /timedelete 12 kisa bicimi de calisir.
+
 1. Bu paketteki .py dosyalarini mevcut robot klasorunuza kopyalayin.
 2. Mevcut robot_records.db dosyanizi silmeyin veya degistirmeyin.
 3. START_V1.bat ile calistirin.

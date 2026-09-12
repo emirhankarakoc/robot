@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import time
 import xml.etree.ElementTree as ET
@@ -107,6 +108,13 @@ class TfmProxy(Proxy):
         self.current_round_id = None
         self.current_mirrored = False
         self.current_map_hash = None
+        self.current_map_width = 800.0
+
+        # A victory is recordable only when it belongs to a NewRound that
+        # this proxy actually observed. SELF victories are additionally
+        # matched against the mapCode+roundId in EnterHolePacket.
+        self.current_round_verified = False
+        self.self_enter_hole_context = None
 
         # Client-only ground size overrides applied once per NewRound.
         # Trampoline and lava keep independent on/off and L/H values.
@@ -162,7 +170,10 @@ class TfmProxy(Proxy):
             "[PROXY] emirhankarakoc v1.10 listeners ready"
         )
         print(
-            "[GROUND RESIZE] OVERLAY-V4 | NO LIMIT | "
+            "[ROBOT] ROUND-MATCH-GUARD-V8 | RECORD-ID-DELETE-V7 | "
+            "MIRROR-INVENTORY-V6 | "
+            "MIRROR-FALLBACK-V5 | "
+            "GROUND-OVERLAY-V4 | NO LIMIT | "
             "/sismanlattrambolin + /sismanlatlav"
         )
 
@@ -404,6 +415,174 @@ class TfmProxy(Proxy):
             self.current_map is not None
             and self.current_round_id is not None
             and self.current_map_hash is not None
+        )
+
+    @staticmethod
+    def _map_width_from_xml(xml):
+        try:
+            root = ET.fromstring(xml)
+            map_settings = root.find("./P")
+
+            if map_settings is None:
+                return 800.0
+
+            width = Decimal(
+                map_settings.attrib.get("L", "800")
+            )
+
+            if not width.is_finite() or width <= 0:
+                return 800.0
+
+            return float(width)
+        except (ET.ParseError, InvalidOperation, TypeError, ValueError):
+            return 800.0
+
+    @staticmethod
+    def _mirror_route_for_orientation(route, *, map_width, target_mirrored):
+        if route is None:
+            return None
+
+        source_mirrored = bool(
+            route.get("mirrored", False)
+        )
+        target_mirrored = bool(target_mirrored)
+
+        if source_mirrored == target_mirrored:
+            return route
+
+        mirrored_route = copy.deepcopy(route)
+
+        for event in mirrored_route.get("events", []):
+            if event.get("x") is not None:
+                event["x"] = (
+                    float(map_width)
+                    - float(event["x"])
+                )
+
+            if event.get("velocityX") is not None:
+                event["velocityX"] = -float(
+                    event["velocityX"]
+                )
+
+            moving_left = bool(
+                event.get("movingLeft", False)
+            )
+            moving_right = bool(
+                event.get("movingRight", False)
+            )
+            event["movingLeft"] = moving_right
+            event["movingRight"] = moving_left
+
+            if "facingRight" in event:
+                event["facingRight"] = not bool(
+                    event["facingRight"]
+                )
+
+            rotation = event.get("rotationInfo")
+
+            if rotation is not None:
+                if rotation.get("rotation") is not None:
+                    rotation["rotation"] = -float(
+                        rotation["rotation"]
+                    )
+
+                if rotation.get("angularVelocity") is not None:
+                    rotation["angularVelocity"] = -float(
+                        rotation["angularVelocity"]
+                    )
+
+        mirrored_route["sourceMirrored"] = source_mirrored
+        mirrored_route["mirrored"] = target_mirrored
+        mirrored_route["mirroredForPlayback"] = True
+        mirrored_route["mirrorWidth"] = float(map_width)
+
+        print(
+            "[MIRROR ROUTE] "
+            f"sourceMirrored={source_mirrored} "
+            f"targetMirrored={target_mirrored} "
+            f"width={float(map_width):.3f} "
+            f"points={len(mirrored_route.get('events', []))}"
+        )
+
+        return mirrored_route
+
+    def _get_best_route_for_current_map(self):
+        route = self.store.get_best_any_route(
+            map_code=self.current_map,
+            mirrored=self.current_mirrored,
+            map_hash=self.current_map_hash,
+        )
+
+        if route is not None:
+            return route
+
+        opposite_route = self.store.get_best_any_route(
+            map_code=self.current_map,
+            mirrored=not self.current_mirrored,
+            map_hash=self.current_map_hash,
+        )
+
+        if opposite_route is None:
+            return None
+
+        print(
+            "[MIRROR FALLBACK] "
+            f"map=@{self.current_map} "
+            f"savedMirrored={bool(opposite_route.get('mirrored', False))} "
+            f"currentMirrored={self.current_mirrored}"
+        )
+
+        return self._mirror_route_for_orientation(
+            opposite_route,
+            map_width=self.current_map_width,
+            target_mirrored=self.current_mirrored,
+        )
+
+    def _get_player_route_for_current_map(self, target_name):
+        route = self.store.get_best_player_record(
+            target_name=target_name,
+            map_code=self.current_map,
+            mirrored=self.current_mirrored,
+            map_hash=self.current_map_hash,
+        )
+
+        if route is not None:
+            return route
+
+        opposite_route = self.store.get_best_player_record(
+            target_name=target_name,
+            map_code=self.current_map,
+            mirrored=not self.current_mirrored,
+            map_hash=self.current_map_hash,
+        )
+
+        return self._mirror_route_for_orientation(
+            opposite_route,
+            map_width=self.current_map_width,
+            target_mirrored=self.current_mirrored,
+        )
+
+    @staticmethod
+    def _orientation_status_line(status, mirrored):
+        orientation = "YES" if mirrored else "NO"
+        key = "mirrored" if mirrored else "normal"
+        item = status.get(key)
+        map_code = int(status["mapCode"])
+        map_hash = str(status.get("mapHash") or "UNKNOWN")
+
+        if item is None:
+            return (
+                f"@{map_code} | hash={map_hash[:12]} | "
+                f"MIRRORED={orientation} | KAYITSIZ"
+            )
+
+        return (
+            f"@{map_code} | hash={map_hash[:12]} | "
+            f"MIRRORED={orientation} | KAYITLI | "
+            f"{item['seconds']:.3f}s | "
+            f"{item['name']} | source={item['source']} | "
+            f"{item['points']} pts | "
+            f"ID={item['source']}:{item['id']}"
         )
 
     @staticmethod
@@ -782,11 +961,7 @@ class TfmProxy(Proxy):
             self.replayer.arm(None)
             return None
 
-        route = self.store.get_best_any_route(
-            map_code=self.current_map,
-            mirrored=self.current_mirrored,
-            map_hash=self.current_map_hash,
-        )
+        route = self._get_best_route_for_current_map()
 
         if route is None:
             self.replayer.arm(None)
@@ -872,6 +1047,9 @@ class TfmProxy(Proxy):
         if already_alive and not respawn_pulse:
             return
 
+        # A fresh life needs its own EnterHole proof before it can be saved.
+        self.self_enter_hole_context = None
+
         if respawn_pulse:
             print(
                 "[LIFE] RESPAWN ALIVE pulse "
@@ -934,6 +1112,7 @@ class TfmProxy(Proxy):
     ):
         was_alive = self.self_alive
         self.self_alive = False
+        self.self_enter_hole_context = None
         self.last_self_alive_signal_ns = None
         self.afk_life_start_ns = None
         self.afk_jumps_done_for_life = False
@@ -1322,6 +1501,59 @@ class TfmProxy(Proxy):
             f"session={self.self_session_id}"
         )
 
+    @pak.packet_listener(
+        serverbound.JoinRoomPacket
+    )
+    async def on_join_room(
+        self,
+        source,
+        packet,
+    ):
+        """Invalidate the previous hand before entering another room."""
+        self._bind_source(source)
+
+        old_map = self.current_map
+        old_round = self.current_round_id
+
+        self.current_round_verified = False
+        self.self_enter_hole_context = None
+        self.first_victory_session_id = None
+
+        self.self_alive = False
+        self.last_self_alive_signal_ns = None
+        self.afk_life_start_ns = None
+        self.afk_jumps_done_for_life = False
+        self.play_pending = False
+        self.selected_route = None
+
+        self.replayer.stop("join-room")
+        self.local_player_replayer.stop("join-room")
+        self._cancel_afk_jump_task("join-room")
+
+        # Preserve a legitimately completed run during its short final
+        # movement window; every other stale recorder context is discarded.
+        if not self.self_victory_capture_pending:
+            self.recorder.disarm("join-room")
+
+        self.player_recorder.invalidate_round("join-room")
+        self.winner_recorder.invalidate_round("join-room")
+        self.players_by_session = {}
+        self.sessions_by_name = {}
+
+        self.current_map = None
+        self.current_round_id = None
+        self.current_map_hash = None
+        self.current_map_width = 800.0
+
+        print(
+            f"[ROUND CONTEXT] INVALIDATED room-change "
+            f"oldMap=@{old_map} oldRound={old_round} "
+            f"targetRoom={getattr(packet, 'name', 'UNKNOWN')}"
+        )
+
+        # Forward JoinRoomPacket normally.
+        return
+
     # ==============================================================
     # NEW ROUND
     # ==============================================================
@@ -1334,6 +1566,9 @@ class TfmProxy(Proxy):
         source,
         packet,
     ):
+        self.current_round_verified = False
+        self.self_enter_hole_context = None
+
         # Incomplete/failed passive target life is never replay data.
         if self.player_recorder.enabled:
             self.player_recorder.on_death(
@@ -1378,6 +1613,10 @@ class TfmProxy(Proxy):
             )
         )
 
+        self.current_map_width = self._map_width_from_xml(
+            xml
+        )
+
         self.current_map_hash = (
             hashlib.sha256(
                 xml.encode(
@@ -1386,6 +1625,8 @@ class TfmProxy(Proxy):
             )
             .hexdigest()
         )
+
+        self.current_round_verified = True
 
         replacement_packet = None
 
@@ -1427,6 +1668,26 @@ class TfmProxy(Proxy):
             f"hash={self.current_map_hash[:12]}"
         )
 
+        orientation_status = self.store.get_orientation_status(
+            map_code=self.current_map,
+            map_hash=self.current_map_hash,
+        )
+
+        for mirrored_value in (False, True):
+            current_marker = (
+                " CURRENT"
+                if mirrored_value == self.current_mirrored
+                else ""
+            )
+            print(
+                "[RECORD STATUS] "
+                + self._orientation_status_line(
+                    orientation_status,
+                    mirrored_value,
+                )
+                + current_marker
+            )
+
         if self.player_recorder.enabled:
             self.player_recorder.start_map(
                 map_code=self.current_map,
@@ -1461,11 +1722,7 @@ class TfmProxy(Proxy):
         self.replay_started_this_round = False
 
         # ALWAYS show the currently usable record at hand start.
-        round_best = self.store.get_best_any_route(
-            map_code=self.current_map,
-            mirrored=self.current_mirrored,
-            map_hash=self.current_map_hash,
-        )
+        round_best = self._get_best_route_for_current_map()
 
         if round_best is not None:
             owner = self._route_owner(round_best)
@@ -1871,11 +2128,7 @@ class TfmProxy(Proxy):
 
                 route = None
                 if self._map_context_ready():
-                    route = self.store.get_best_any_route(
-                        map_code=self.current_map,
-                        mirrored=self.current_mirrored,
-                        map_hash=self.current_map_hash,
-                    )
+                    route = self._get_best_route_for_current_map()
 
                 if route is not None:
                     self.afk_waiting_for_route = False
@@ -2081,92 +2334,95 @@ class TfmProxy(Proxy):
         # --------------------------
 
         if command == "timelist":
-            # No argument -> list ALL saved maps.
-            if argument_raw is None:
-                items = self.store.get_all_time_bests()
+            requested_map = None
 
-                if not items:
-                    print("[TIMELIST] EMPTY")
+            if argument_raw is not None:
+                value = argument_raw.strip()
+
+                if value.startswith("@"):
+                    value = value[1:]
+
+                try:
+                    requested_map = int(value)
+                except ValueError:
                     await self._chat(
-                        "TIMELIST | no saved records",
+                        "usage: /timelist | /timelist @7680000",
                         source,
                     )
                     return self.DO_NOTHING
 
-                print()
-                print("=" * 72)
-                print(f" TIMELIST | {len(items)} SAVED MAP(S)")
-                print("=" * 72)
+            statuses = self.store.get_all_orientation_statuses(
+                map_code=requested_map
+            )
 
+            # The current exact map can be reported as two KAYITSIZ rows even
+            # before either orientation has ever been stored in SQLite.
+            if (
+                not statuses
+                and requested_map is not None
+                and self._map_context_ready()
+                and requested_map == self.current_map
+            ):
+                statuses = [
+                    self.store.get_orientation_status(
+                        map_code=self.current_map,
+                        map_hash=self.current_map_hash,
+                    )
+                ]
+
+            if not statuses:
+                label = (
+                    f"@{requested_map}"
+                    if requested_map is not None
+                    else "ALL"
+                )
+                print(f"[TIMELIST] {label} EMPTY")
                 await self._chat(
-                    f"TIMELIST | {len(items)} map(s)",
+                    f"TIMELIST {label} | no saved variants",
                     source,
                 )
+                return self.DO_NOTHING
 
-                for item in items:
-                    line = (
-                        f"@{item['mapCode']} | "
-                        f"{item['seconds']:.3f}s | "
-                        f"{item['name']} | "
-                        f"{item['points']} pts"
+            unique_maps = {
+                int(status["mapCode"])
+                for status in statuses
+            }
+
+            print()
+            print("=" * 96)
+            print(
+                f" TIMELIST | {len(unique_maps)} MAP(S) | "
+                f"{len(statuses)} EXACT HASH VARIANT(S) | "
+                f"{len(statuses) * 2} ORIENTATION ROW(S)"
+            )
+            print("=" * 96)
+
+            await self._chat(
+                f"TIMELIST | {len(unique_maps)} map(s) | "
+                f"{len(statuses)} hash variant(s) | YES/NO separated",
+                source,
+            )
+
+            for status in statuses:
+                for mirrored_value in (False, True):
+                    line = self._orientation_status_line(
+                        status,
+                        mirrored_value,
                     )
-
-                    print(line)
+                    print(f"[TIMELIST] {line}")
                     await self._chat(
                         line,
                         source,
                     )
 
-                print("=" * 72)
-                print()
-                return self.DO_NOTHING
-
-            # With @map -> single map BEST.
-            value = argument_raw.strip()
-
-            if value.startswith("@"):
-                value = value[1:]
-
-            try:
-                map_code = int(value)
-            except ValueError:
-                await self._chat(
-                    "usage: /timelist | /timelist @7680000",
-                    source,
-                )
-                return self.DO_NOTHING
-
-            item = self.store.get_time_best(
-                map_code=map_code,
-            )
-
-            if item is None:
-                print(f"[TIMELIST] @{map_code} EMPTY")
-                await self._chat(
-                    f"BEST @{map_code} | no saved record",
-                    source,
-                )
-                return self.DO_NOTHING
-
-            line = (
-                f"BEST @{map_code} | "
-                f"{item['seconds']:.3f}s | "
-                f"{item['name']} | "
-                f"{item['points']} pts"
-            )
-
-            print(f"[TIMELIST] {line}")
-
-            await self._chat(
-                line,
-                source,
-            )
-
+            print("=" * 96)
+            print()
             return self.DO_NOTHING
 
         # --------------------------
         # /timedelete
         # /timedelete @mapCode
+        # /timedelete SELF:id | PLAYER:id | id
         # /timedelete all
         # --------------------------
 
@@ -2198,16 +2454,90 @@ class TfmProxy(Proxy):
                 value = argument_raw.strip()
 
                 if value.startswith("@"):
-                    value = value[1:]
+                    try:
+                        requested_map = int(value[1:])
+                    except ValueError:
+                        await self._chat(
+                            "usage: /timedelete | /timedelete @map | "
+                            "/timedelete ID | /timedelete all",
+                            source,
+                        )
+                        return self.DO_NOTHING
+                else:
+                    reference = value.upper()
+                    record_source = None
+                    record_id_text = reference
 
-                try:
-                    requested_map = int(value)
-                except ValueError:
-                    await self._chat(
-                        "usage: /timedelete | /timedelete @7680000 | /timedelete all",
-                        source,
+                    if ":" in reference:
+                        source_text, record_id_text = reference.split(":", 1)
+                        source_aliases = {
+                            "S": "SELF",
+                            "SELF": "SELF",
+                            "P": "PLAYER",
+                            "PLAYER": "PLAYER",
+                        }
+                        record_source = source_aliases.get(source_text)
+
+                        if record_source is None:
+                            record_id_text = ""
+                    elif len(reference) > 1 and reference[0] in ("S", "P"):
+                        record_source = (
+                            "SELF" if reference[0] == "S" else "PLAYER"
+                        )
+                        record_id_text = reference[1:]
+
+                    try:
+                        record_id = int(record_id_text)
+                    except ValueError:
+                        await self._chat(
+                            "usage: /timedelete SELF:12 | "
+                            "/timedelete PLAYER:7 | /timedelete 12",
+                            source,
+                        )
+                        return self.DO_NOTHING
+
+                    result = self.store.delete_record(
+                        record_id=record_id,
+                        source=record_source,
                     )
 
+                    if not result["ok"]:
+                        if result["reason"] == "ambiguous":
+                            choices = " or ".join(
+                                match["reference"]
+                                for match in result["matches"]
+                            )
+                            message = (
+                                f"TIMEDELETE ID={record_id} ambiguous | "
+                                f"use /timedelete {choices}"
+                            )
+                        else:
+                            message = (
+                                f"TIMEDELETE ID={reference} failed | "
+                                f"{result['reason']}"
+                            )
+
+                        await self._chat(message, source)
+                        return self.DO_NOTHING
+
+                    if (
+                        self.current_map is not None
+                        and int(result["mapCode"]) == int(self.current_map)
+                    ):
+                        self.replayer.stop("timedelete-record-id")
+                        self.selected_route = None
+                        self.play_pending = False
+
+                        if self.play_mode and self._map_context_ready():
+                            self._load_play_for_current_map()
+
+                    await self._chat(
+                        f"TIMEDELETE ID={result['reference']} | "
+                        f"@{result['mapCode']} | "
+                        f"MIRRORED={'YES' if result['mirrored'] else 'NO'} | "
+                        f"deleted {result['deleted']} row(s)",
+                        source,
+                    )
                     return self.DO_NOTHING
 
             map_code = (
@@ -2402,11 +2732,13 @@ class TfmProxy(Proxy):
                 ),
 
                 (
-                    "/timelist | tum kayitli mapleri gosterir. /timelist @map | tek map BEST."
+                    "/timelist | tum map/hash kayitlarini MIRRORED YES/NO ayirir. "
+                    "/timelist @map | tek mapin iki yonunu gosterir."
                 ),
 
                 (
                     "/timedelete [@map] | map kaydini siler. "
+                    "/timedelete ID | tek kaydi siler. "
                     "/timedelete all | tum kayitlari siler."
                 ),
 
@@ -2556,11 +2888,8 @@ class TfmProxy(Proxy):
 
                 return self.DO_NOTHING
 
-            record = self.store.get_best_player_record(
-                target_name=argument_raw,
-                map_code=self.current_map,
-                mirrored=self.current_mirrored,
-                map_hash=self.current_map_hash,
+            record = self._get_player_route_for_current_map(
+                argument_raw
             )
 
             if record is None:
@@ -2953,8 +3282,47 @@ class TfmProxy(Proxy):
             return
 
     # ==============================================================
-    # CLIENT -> SERVER DEATH
+    # CLIENT -> SERVER HOLE / DEATH
     # ==============================================================
+
+    @pak.packet_listener(
+        serverbound.EnterHolePacket
+    )
+    async def on_self_enter_hole(
+        self,
+        source,
+        packet,
+    ):
+        self._bind_source(source)
+
+        victory_map_code = int(packet.map_code)
+        victory_round_id = int(packet.round_id)
+        valid = (
+            self.current_round_verified
+            and self.current_map is not None
+            and self.current_round_id is not None
+            and victory_map_code == int(self.current_map)
+            and victory_round_id == int(self.current_round_id)
+        )
+
+        self.self_enter_hole_context = {
+            "mapCode": victory_map_code,
+            "roundId": victory_round_id,
+            "valid": bool(valid),
+            "observedNs": time.perf_counter_ns(),
+        }
+
+        print(
+            f"[ENTER HOLE CONTEXT] "
+            f"newRoundMap=@{self.current_map} "
+            f"victoryMap=@{victory_map_code} "
+            f"newRoundRound={self.current_round_id} "
+            f"victoryRound={victory_round_id} "
+            f"match={'YES' if valid else 'NO'}"
+        )
+
+        # Forward the real EnterHolePacket normally.
+        return
 
     @pak.packet_listener(
         serverbound.PlayerDiedPacket
@@ -2974,6 +3342,7 @@ class TfmProxy(Proxy):
         )
 
         self.self_alive = False
+        self.self_enter_hole_context = None
         self.last_self_alive_signal_ns = None
 
         if (
@@ -3045,6 +3414,7 @@ class TfmProxy(Proxy):
         *,
         victory_ns,
         finish_seconds,
+        victory_map_code,
         victory_round_id,
         save_mode,
     ):
@@ -3055,11 +3425,14 @@ class TfmProxy(Proxy):
 
             if (
                 context is None
+                or int(context.get("mapCode", -1))
+                != int(victory_map_code)
                 or int(context.get("roundId", -1))
                 != int(victory_round_id)
             ):
                 print(
                     "[RECORD FINALIZE SKIP] "
+                    f"victoryMap=@{victory_map_code} "
                     f"victoryRound={victory_round_id} "
                     "recorder context changed"
                 )
@@ -3124,25 +3497,109 @@ class TfmProxy(Proxy):
     ):
         victory_ns = time.perf_counter_ns()
 
+        winner_session_id = int(packet.session_id)
+        is_self_victory = (
+            self.self_session_id is not None
+            and winner_session_id == int(self.self_session_id)
+        )
+
+        winner_name = self.players_by_session.get(
+            winner_session_id,
+            (
+                self.self_name
+                if is_self_victory
+                else f"session-{winner_session_id}"
+            ),
+        )
+
+        # PlayerVictoryPacket itself has no mapCode in the standard protocol.
+        # For SELF, EnterHolePacket is the authoritative victory context.
+        victory_map_code = getattr(packet, "map_code", None)
+        victory_round_id = getattr(packet, "round_id", None)
+        hole_context = (
+            self.self_enter_hole_context
+            if is_self_victory
+            else None
+        )
+
+        if is_self_victory and hole_context is not None:
+            if victory_map_code is None:
+                victory_map_code = hole_context.get("mapCode")
+
+            if victory_round_id is None:
+                victory_round_id = hole_context.get("roundId")
+
+        invalid_reasons = []
+
+        if (
+            not self.current_round_verified
+            or self.current_map is None
+            or self.current_round_id is None
+        ):
+            invalid_reasons.append("new-round-not-observed")
+
+        if is_self_victory and victory_map_code is None:
+            invalid_reasons.append("missing-enter-hole-map")
+
+        if is_self_victory and victory_round_id is None:
+            invalid_reasons.append("missing-enter-hole-round")
+
+        if (
+            victory_map_code is not None
+            and self.current_map is not None
+            and int(victory_map_code) != int(self.current_map)
+        ):
+            invalid_reasons.append("map-code-mismatch")
+
+        if (
+            victory_round_id is not None
+            and self.current_round_id is not None
+            and int(victory_round_id) != int(self.current_round_id)
+        ):
+            invalid_reasons.append("round-id-mismatch")
+
+        victory_context_valid = not invalid_reasons
+
+        if not victory_context_valid:
+            reason = ",".join(invalid_reasons)
+            print(
+                f"[NON-NORMAL RUN SKIP] "
+                f"owner={winner_name} "
+                f"newRoundMap=@{self.current_map} "
+                f"victoryMap=@{victory_map_code} "
+                f"newRoundRound={self.current_round_id} "
+                f"victoryRound={victory_round_id} "
+                f"reason={reason}"
+            )
+
+            await self._chat(
+                f"RECORD SKIP | NON-NORMAL RUN | "
+                f"NewRound=@{self.current_map}/{self.current_round_id} | "
+                f"Victory=@{victory_map_code}/{victory_round_id} | "
+                f"{reason}"
+            )
+
+            self.winner_recorder.on_dead(
+                winner_session_id,
+                source="invalid-victory-context",
+            )
+
+            # Preserve unrelated first-place/chat behavior, but mark this
+            # invalid hand consumed so no route from it can be learned.
+            if self.first_victory_session_id is None:
+                self.first_victory_session_id = winner_session_id
+
+                if is_self_victory:
+                    await self._maybe_chat_after_first(
+                        winner_session_id=winner_session_id,
+                    )
+
         # Learn the first ELIGIBLE finisher.
         # Blacklisted owners are ignored so they cannot poison training data.
-        if self.first_victory_session_id is None:
-            winner_session_id = int(
-                packet.session_id
-            )
-
-            winner_name = self.players_by_session.get(
-                winner_session_id,
-                (
-                    self.self_name
-                    if (
-                        self.self_session_id is not None
-                        and winner_session_id == int(self.self_session_id)
-                    )
-                    else f"session-{winner_session_id}"
-                ),
-            )
-
+        if (
+            victory_context_valid
+            and self.first_victory_session_id is None
+        ):
             if self.store.is_blacklisted(
                 winner_name
             ):
@@ -3259,16 +3716,17 @@ class TfmProxy(Proxy):
             and int(packet.session_id)
             == int(self.player_recorder.target_session_id)
         ):
-            await self._finish_player_record(
-                "victory",
-                victory_seconds=float(packet.seconds),
-            )
+            if victory_context_valid:
+                await self._finish_player_record(
+                    "victory",
+                    victory_seconds=float(packet.seconds),
+                )
+            else:
+                self.player_recorder.on_death(
+                    "invalid-victory-context"
+                )
 
-        if (
-            self.self_session_id is None
-            or packet.session_id
-            != self.self_session_id
-        ):
+        if not is_self_victory:
             return
 
         finish_seconds = float(
@@ -3283,14 +3741,25 @@ class TfmProxy(Proxy):
         capture_mode = None
 
         if (
+            victory_context_valid
+            and
             self.play_mode
             and self.auto_record_fallback
             and self.recorder.active
         ):
             capture_mode = "autolearn"
 
-        elif self.record_mode and self.recorder.active:
+        elif (
+            victory_context_valid
+            and self.record_mode
+            and self.recorder.active
+        ):
             capture_mode = "record"
+
+        elif not victory_context_valid and self.recorder.armed:
+            self.recorder.on_death(
+                "invalid-victory-context"
+            )
 
         if capture_mode is not None:
             self.self_victory_capture_pending = True
@@ -3306,6 +3775,7 @@ class TfmProxy(Proxy):
                 self._finalize_self_victory_after_capture(
                     victory_ns=victory_ns,
                     finish_seconds=finish_seconds,
+                    victory_map_code=int(victory_map_code),
                     victory_round_id=int(self.current_round_id),
                     save_mode=capture_mode,
                 )
@@ -3325,5 +3795,6 @@ class TfmProxy(Proxy):
             self.play_pending = False
 
         self.self_alive = False
+        self.self_enter_hole_context = None
         self.last_self_alive_signal_ns = None
         self.afk_life_start_ns = None

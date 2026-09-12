@@ -18,9 +18,9 @@ echo   /chatafterfirst on ^| off ^| [message]
 echo   /afkfarming on ^| off
 echo   /recordplayer Nick#0000 ^| off
 echo   /playplayer Nick#0000 ^| off
-echo   /timelist              - all saved maps
-echo   /timelist @mapCode     - one map
-echo   /timedelete [@mapCode^|all]
+echo   /timelist              - all maps, MIRRORED YES/NO
+echo   /timelist @mapCode     - one map, MIRRORED YES/NO
+echo   /timedelete [ID^|@mapCode^|all]
 echo   /timeowner @mapCode Nick#0000
 echo   /blacklist add/remove/list/clear [Nick#0000]
 echo.

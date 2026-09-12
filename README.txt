@@ -1,6 +1,76 @@
 emirhankarakoc v1.15
 ===================
 
+ROUND / MAP RECORD GUARD
+------------------------
+
+Changing rooms invalidates the previous map and round context. A victory is
+eligible for recording only after this proxy has observed a NewRoundPacket for
+the hand. For SELF records, the mapCode and roundId from the real outgoing
+EnterHolePacket must exactly match the current NewRoundPacket.
+
+Valid:
+
+    [ENTER HOLE CONTEXT] newRoundMap=@100 victoryMap=@100 ... match=YES
+
+Invalid runs never reach SQLite:
+
+    [NON-NORMAL RUN SKIP] ... newRoundMap=@100 victoryMap=@999 ...
+    reason=map-code-mismatch
+
+This prevents stale/non-normal runs received around room changes from being
+stored under the wrong map.
+
+MIRRORED ROUTE FALLBACK
+-----------------------
+
+Every SELF, selected-player and first-winner record keeps the mirrored value
+of the round where it was captured. Playback first looks for a record with the
+same mapCode + mapHash + mirrored value.
+
+If the matching orientation has no record but the opposite orientation does,
+the opposite route is mirrored for playback automatically. The conversion
+uses the current map width from <P L="..."> (default 800) and transforms:
+
+    x
+    velocityX
+    movingLeft / movingRight
+    facingRight
+    rotation / angularVelocity
+
+The stored record is never modified. A converted copy is used only for the
+current playback. Terminal diagnostics show:
+
+    [MIRROR FALLBACK] ...
+    [MIRROR ROUTE] sourceMirrored=... targetMirrored=...
+
+MIRRORED RECORD INVENTORY
+-------------------------
+
+Every NewRound prints two independent rows for the current exact map hash:
+
+    [RECORD STATUS] @1351308 | hash=d00aa3857824 | MIRRORED=NO | KAYITLI | ...
+    [RECORD STATUS] @1351308 | hash=d00aa3857824 | MIRRORED=YES | KAYITSIZ CURRENT
+
+/timelist and /timelist @mapCode no longer collapse both orientations into a
+single map row. For every exact mapCode+mapHash variant they print separate
+MIRRORED=NO and MIRRORED=YES rows, including an explicit KAYITSIZ row when the
+opposite orientation has no saved route.
+
+Every KAYITLI row ends with an unambiguous record ID:
+
+    ID=SELF:12
+    ID=PLAYER:7
+
+Delete only that exact record with:
+
+    /timedelete SELF:12
+    /timedelete PLAYER:7
+
+The short form /timedelete 12 also works when that numeric ID exists in only
+one table. If SELF:12 and PLAYER:12 both exist, the command refuses the
+ambiguous number and tells you which full ID to use.
+
 TRAMPOLINE + LAVA SIZE OVERRIDE (CLIENT ONLY)
 ---------------------------------------------
 
@@ -212,6 +282,11 @@ Delete current map:
 
     /timedelete
 
+Delete one listed record by ID:
+
+    /timedelete SELF:12
+    /timedelete PLAYER:7
+
 Delete map:
 
     /timedelete @7680000
@@ -404,7 +479,8 @@ Single map:
 
     BEST @7680000 | 14.921s | Pedro#4565 | 63 pts
 
-Database row IDs are no longer shown in chat/terminal timelist output.
+V1.6 hid raw database row IDs. RECORD-ID-DELETE-V7 brings them back as
+unambiguous SELF:id / PLAYER:id references so one exact row can be deleted.
 
 
 V1.7 - CHATAFTERFIRST
