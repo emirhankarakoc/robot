@@ -10,7 +10,7 @@ class RecordStore:
 
     Rules:
       - lifecycle v3 only
-      - minimum replayable time: 8.000 seconds
+      - minimum replayable time: 7.100 seconds
       - one BEST record per exact map identity
       - SELF and learned PLAYER routes compete for that one BEST
       - blacklist is persistent
@@ -18,7 +18,7 @@ class RecordStore:
     """
 
     LIFE_TIMER_VERSION = 3
-    MIN_RECORD_SECONDS = 8.0
+    MIN_RECORD_SECONDS = 7.1
 
     def __init__(self, db_path="robot_records.db"):
         self.db_path = Path(db_path)

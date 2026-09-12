@@ -663,31 +663,12 @@ class TfmProxy(Proxy):
                     ),
                 )
             else:
+                # Match the smooth baseline: Alive only arms playback. The
+                # first real outgoing movement provides the timing anchor and
+                # starts the saved trajectory.
                 self.play_pending = (
                     self.selected_route is not None
                 )
-
-                if (
-                    self.play_pending
-                    and self.serverbound_source is not None
-                    and not self.replayer.is_active()
-                ):
-                    started = self.replayer.start(
-                        round_id=self.current_round_id,
-                        source_conn=self.serverbound_source,
-                        self_session_id=self.self_session_id,
-                    )
-
-                    self.play_pending = not started
-
-                    if started:
-                        self.replay_started_this_round = True
-                        print(
-                            f"[REPLAY ROUND FLAG] "
-                            f"map=@{self.current_map} "
-                            "replayStartedThisRound=True "
-                            "source=alive"
-                        )
 
         elif self.record_mode:
             self.recorder.on_alive(
@@ -2472,6 +2453,42 @@ class TfmProxy(Proxy):
     # CLIENT -> SERVER MOVEMENT
     # ==============================================================
 
+    def _ensure_self_alive_from_movement(self, observed_ns):
+        """Rare fallback path for rooms that omit/delay Alive activity."""
+        if self.self_alive:
+            return
+
+        self.self_alive = True
+
+        if self.afk_life_start_ns is None:
+            self.afk_life_start_ns = int(observed_ns)
+
+        self.afk_jumps_done_for_life = False
+
+        print(
+            "[LIFE] SELF movement-fallback "
+            "ALIVE -> t=0"
+        )
+
+        if self.play_mode and self.auto_record_fallback:
+            self.recorder.on_alive(
+                observed_ns,
+                source="movement-fallback",
+            )
+
+        elif self.record_mode and not self.play_mode:
+            self.recorder.on_alive(
+                observed_ns,
+                source="movement-fallback",
+            )
+
+        if (
+            self.play_mode
+            and not self.auto_record_fallback
+            and self.selected_route is not None
+        ):
+            self.play_pending = True
+
     @pak.packet_listener(
         serverbound.PlayerMovementPacket
     )
@@ -2484,13 +2501,12 @@ class TfmProxy(Proxy):
             source
         )
 
-        observed_ns = time.perf_counter_ns()
-
+        # Rare post-victory capture path. Normal recording and playback never
+        # enter this branch.
         if self.self_victory_capture_pending:
             if self.recorder.armed and self.recorder.active:
                 self.recorder.record_movement(
                     packet,
-                    observed_ns=observed_ns,
                 )
 
                 print(
@@ -2506,54 +2522,34 @@ class TfmProxy(Proxy):
 
             return
 
-        self._maybe_start_afk_jumps(
-            source,
-            packet,
-        )
-
-        # Movement itself proves the player is alive.
-        # This fallback is important in training/racing rooms where an
-        # Alive activity update may arrive late or not at all.
+        # Most rooms already delivered Alive. This slow setup runs at most
+        # once per life when that signal is missing or late.
         if not self.self_alive:
-            self.self_alive = True
-
-            if self.afk_life_start_ns is None:
-                self.afk_life_start_ns = int(observed_ns)
-
-            self.afk_jumps_done_for_life = False
-
-            print(
-                "[LIFE] SELF movement-fallback "
-                "ALIVE -> t=0"
+            self._ensure_self_alive_from_movement(
+                time.perf_counter_ns()
             )
 
-            if (
-                self.play_mode
-                and self.auto_record_fallback
-            ):
-                self.recorder.on_alive(
-                    observed_ns,
-                    source="movement-fallback",
-                )
+        # AFK scheduling is evaluated only until its one task is created.
+        if self.afk_jump_pending and self.afk_jump_task is None:
+            self._maybe_start_afk_jumps(
+                source,
+                packet,
+            )
 
-            elif (
-                self.record_mode
-                and not self.play_mode
-            ):
-                self.recorder.on_alive(
-                    observed_ns,
-                    source="movement-fallback",
-                )
+        # RECORD hot path: identical shape to the smooth baseline.
+        if (
+            self.record_mode
+            and not self.play_mode
+            and self.recorder.active
+        ):
+            self.recorder.record_movement(
+                packet
+            )
 
-            if (
-                self.play_mode
-                and not self.auto_record_fallback
-                and self.selected_route is not None
-            ):
-                self.play_pending = True
+            return
 
-        # PLAY route exists:
-        # start saved trajectory and block physical movement while active.
+        # PLAY hot path: arm/start once, then block live movement while the
+        # saved trajectory owns the backend.
         if (
             self.play_mode
             and not self.auto_record_fallback
@@ -2586,31 +2582,30 @@ class TfmProxy(Proxy):
             if self.replayer.is_active():
                 return self.DO_NOTHING
 
-        # PLAY has no route -> normal play + automatic recording.
+        # PLAY with no route keeps the current autolearn behavior. Once the
+        # recorder is active this is the same direct record call as above.
         if (
             self.play_mode
             and self.auto_record_fallback
         ):
             self.recorder.ensure_alive_from_movement(
-                observed_ns
+                time.perf_counter_ns()
             )
 
             self.recorder.record_movement(
-                packet,
-                observed_ns=observed_ns,
+                packet
             )
 
             return
 
-        # Plain persistent RECORD.
+        # A late /record on can reach here before the first Alive packet.
         if self.record_mode:
             self.recorder.ensure_alive_from_movement(
-                observed_ns
+                time.perf_counter_ns()
             )
 
             self.recorder.record_movement(
-                packet,
-                observed_ns=observed_ns,
+                packet
             )
 
             return
@@ -2677,37 +2672,31 @@ class TfmProxy(Proxy):
         source,
         packet,
     ):
-        # Passive winner-learning while RECORD or PLAY is enabled.
+        # Critical path: passive winner learning stays synchronous so the
+        # first-place trajectory is complete before PlayerVictoryPacket.
         self.winner_recorder.observe(
             packet,
             self_session_id=self.self_session_id,
         )
 
-        if not self.player_recorder.enabled:
-            return
+        # Secondary /recordplayer work is a single unlocked attribute check
+        # while disabled (the normal case).
+        session_id = int(packet.session_id)
+        target_session_id = self.player_recorder.target_session_id
 
-        session_id = int(
-            packet.session_id
-        )
-
-        # We only record the selected remote target.
         if (
-            self.player_recorder.target_session_id is None
-            or session_id
-            != int(self.player_recorder.target_session_id)
+            target_session_id is None
+            or session_id != int(target_session_id)
         ):
             return
 
-        # Never reinterpret our own movement as a remote target.
         if (
             self.self_session_id is not None
             and session_id == int(self.self_session_id)
         ):
             return
 
-        self.player_recorder.observe(
-            packet
-        )
+        self.player_recorder.observe(packet)
 
     async def _finalize_self_victory_after_capture(
         self,
@@ -2791,6 +2780,8 @@ class TfmProxy(Proxy):
         source,
         packet,
     ):
+        victory_ns = time.perf_counter_ns()
+
         # Learn the first ELIGIBLE finisher.
         # Blacklisted owners are ignored so they cannot poison training data.
         if self.first_victory_session_id is None:
@@ -2830,6 +2821,7 @@ class TfmProxy(Proxy):
                 winner_record = self.winner_recorder.winner_record(
                     packet.session_id,
                     float(packet.seconds),
+                    observed_ns=victory_ns,
                 )
 
                 # Self winner is stored by the normal self recorder below.
@@ -2945,8 +2937,6 @@ class TfmProxy(Proxy):
             f"[VICTORY] SERVER "
             f"time={finish_seconds:.3f}s"
         )
-
-        victory_ns = time.perf_counter_ns()
 
         capture_mode = None
 

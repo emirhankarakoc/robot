@@ -731,11 +731,12 @@ class Replayer:
                     round_id,
                 )
 
-                self._log_server_packet(
-                    packet,
-                    event,
-                    reason="replay",
-                )
+                if self.debug_logs:
+                    self._log_server_packet(
+                        packet,
+                        event,
+                        reason="replay",
+                    )
 
                 await (
                     source_conn
