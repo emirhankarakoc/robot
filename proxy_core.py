@@ -39,7 +39,8 @@ class TfmProxy(Proxy):
 
     PLAY:
         best SQLite record for current map is loaded
-        next Alive + first client movement starts replay
+        NewRound is the replay clock anchor
+        saved timestamps preserve the original 3-2-1 timing
         live client movement is blocked
         saved movement packets are sent to backend at recorded timestamps
     """
@@ -110,11 +111,26 @@ class TfmProxy(Proxy):
         self.current_map_hash = None
         self.current_map_width = 800.0
 
+        # The records room emits StartRoundCountdownPacket as a real edge:
+        # True before NewRound starts the 3-2-1 state, then False releases
+        # controls. Playback waits for that falling edge instead of estimating
+        # a fixed duration from NewRound/Alive/client heartbeat packets.
+        self.round_countdown_active = False
+        self.round_countdown_packet_seen = False
+        self.current_round_anchor_time = None
+        self.awaiting_countdown_end = False
+
         # A victory is recordable only when it belongs to a NewRound that
         # this proxy actually observed. SELF victories are additionally
         # matched against the mapCode+roundId in EnterHolePacket.
         self.current_round_verified = False
         self.self_enter_hole_context = None
+
+        # The first NewRound received after an explicit JoinRoom is a snapshot
+        # of the hand already in progress, not proof that this proxy observed
+        # its real start. It is quarantined until the following NewRound.
+        self.pending_join_snapshot = False
+        self.current_round_join_snapshot = False
 
         # Client-only ground size overrides applied once per NewRound.
         # Trampoline and lava keep independent on/off and L/H values.
@@ -146,7 +162,9 @@ class TfmProxy(Proxy):
         # Captured from a real client->server connection.
         self.serverbound_source = None
 
-        # PLAY waits until the first outgoing movement after Alive.
+        # Normally consumed immediately by NewRound synchronization. It stays
+        # True only when the backend connection was not available at NewRound,
+        # or when a same-round respawn needs the movement fallback.
         self.play_pending = False
 
         # /chatafterfirst
@@ -157,6 +175,10 @@ class TfmProxy(Proxy):
         self.chat_after_first_message = None
         self.chat_after_first_sent_this_round = False
         self.replay_started_this_round = False
+
+        # Controls only local proxy/status messages injected into game chat.
+        # Real room chat such as /chatafterfirst remains independent.
+        self.chat_logging = True
 
         # High-frequency terminal diagnostics are OFF by default.
         # This avoids console I/O in movement hot paths.
@@ -170,7 +192,15 @@ class TfmProxy(Proxy):
             "[PROXY] emirhankarakoc v1.10 listeners ready"
         )
         print(
-            "[ROBOT] ROUND-MATCH-GUARD-V8 | RECORD-ID-DELETE-V7 | "
+            "[ROBOT] JOIN-SNAPSHOT-GUARD-V16 | BACKEND-FIRST-V15 | "
+            "COUNTDOWN-EDGE-SYNC-V14 | "
+            "NEWROUND-CLOCK-SYNC-V13 | "
+            "COUNTDOWN-SYNC-V12 | "
+            "MAP-START-SYNC-V11 | "
+            "MAP-START-FAST-V10 | "
+            "CHATLOGGING-ROUND-ID-V9 | "
+            "ROUND-MATCH-GUARD-V8 | "
+            "RECORD-ID-DELETE-V7 | "
             "MIRROR-INVENTORY-V6 | "
             "MIRROR-FALLBACK-V5 | "
             "GROUND-OVERLAY-V4 | NO LIMIT | "
@@ -417,6 +447,84 @@ class TfmProxy(Proxy):
             and self.current_map_hash is not None
         )
 
+    def _start_selected_route(
+        self,
+        *,
+        trigger,
+        anchor_time=None,
+        first_control_target_seconds=None,
+        start_at_first_control=False,
+        source_conn=None,
+    ):
+        """Start the armed route once and keep fallback state consistent."""
+        if not (
+            self.play_mode
+            and not self.auto_record_fallback
+            and self.selected_route is not None
+            and not self.replayer.is_active()
+        ):
+            return False
+
+        connection = (
+            source_conn
+            if source_conn is not None
+            else self.serverbound_source
+        )
+
+        started = self.replayer.start(
+            round_id=self.current_round_id,
+            source_conn=connection,
+            self_session_id=self.self_session_id,
+            anchor_time=anchor_time,
+            trim_initial_delay=(
+                first_control_target_seconds is None
+            ),
+            countdown_target_seconds=first_control_target_seconds,
+            start_at_first_control=start_at_first_control,
+            trigger=trigger,
+        )
+
+        self.play_pending = not started
+
+        if started:
+            self.replay_started_this_round = True
+            print(
+                f"[REPLAY ROUND FLAG] "
+                f"map=@{self.current_map} "
+                "replayStartedThisRound=True "
+                f"source={trigger}"
+            )
+
+        return started
+
+    async def _start_selected_route_at_countdown_release(
+        self,
+        *,
+        release_time,
+    ):
+        """Send the first control directly; do not put a task hop before it."""
+        if not (
+            self.play_mode
+            and not self.auto_record_fallback
+            and self.selected_route is not None
+            and not self.replayer.is_active()
+        ):
+            return False
+
+        started = await self.replayer.start_at_countdown_release(
+            round_id=self.current_round_id,
+            source_conn=self.serverbound_source,
+            self_session_id=self.self_session_id,
+            release_time=release_time,
+        )
+
+        self.play_pending = not started
+
+        if started:
+            self.replay_started_this_round = True
+
+        return started
+
     @staticmethod
     def _map_width_from_xml(xml):
         try:
@@ -608,6 +716,19 @@ class TfmProxy(Proxy):
             return float(route["finishMs"]) / 1000.0
 
         return None
+
+    @staticmethod
+    def _route_record_reference(route):
+        if not route or route.get("id") is None:
+            return "UNKNOWN"
+
+        source = str(route.get("source") or "").upper()
+
+        if source not in ("SELF", "PLAYER"):
+            kind = str(route.get("kind") or "").lower()
+            source = "PLAYER" if "passive" in kind else "SELF"
+
+        return f"{source}:{int(route['id'])}"
 
     def _cancel_afk_jump_task(self, reason):
         task = self.afk_jump_task
@@ -924,6 +1045,7 @@ class TfmProxy(Proxy):
         if not (
             self.record_mode
             and self._map_context_ready()
+            and self.current_round_verified
         ):
             return
 
@@ -941,7 +1063,12 @@ class TfmProxy(Proxy):
                 self.current_round_id,
         )
 
-    def _load_play_for_current_map(self):
+    def _load_play_for_current_map(
+        self,
+        route=None,
+        *,
+        route_checked=False,
+    ):
         """
         Select the best route for the current map from BOTH sources:
 
@@ -961,24 +1088,38 @@ class TfmProxy(Proxy):
             self.replayer.arm(None)
             return None
 
-        route = self._get_best_route_for_current_map()
+        # NewRound already loads this route for its status line. Reusing it
+        # avoids a duplicate SQLite lookup at the latency-sensitive start of
+        # every map. Other callers can keep the original lookup behavior.
+        if not route_checked:
+            route = self._get_best_route_for_current_map()
 
         if route is None:
             self.replayer.arm(None)
 
             self.auto_record_fallback = True
 
-            # Use the same plain Recorder used by /record.
-            self.recorder.arm(
-                map_code=self.current_map,
-                mirrored=self.current_mirrored,
-                map_hash=self.current_map_hash,
-                round_id=self.current_round_id,
-            )
+            if self.current_round_verified:
+                # Use the same plain Recorder used by /record.
+                self.recorder.arm(
+                    map_code=self.current_map,
+                    mirrored=self.current_mirrored,
+                    map_hash=self.current_map_hash,
+                    round_id=self.current_round_id,
+                )
+            else:
+                self.recorder.disarm(
+                    "joined-mid-round-snapshot"
+                )
 
             print(
                 "[AUTOLEARN] NO ROUTE -> "
-                "manual movement allowed; recording this attempt"
+                "manual movement allowed; "
+                + (
+                    "recording this attempt"
+                    if self.current_round_verified
+                    else "recording disabled for join snapshot"
+                )
             )
 
             return None
@@ -1089,11 +1230,10 @@ class TfmProxy(Proxy):
                     ),
                 )
             else:
-                # Match the smooth baseline: Alive only arms playback. The
-                # first real outgoing movement provides the timing anchor and
-                # starts the saved trajectory.
                 self.play_pending = (
                     self.selected_route is not None
+                    and not self.replayer.is_active()
+                    and not self.awaiting_countdown_end
                 )
 
         elif self.record_mode:
@@ -1253,26 +1393,31 @@ class TfmProxy(Proxy):
 
         return sent
 
-    async def _chat(self, message, source=None):
+    async def _chat(self, message, source=None, *, force=False):
         """
         Show proxy command/status messages inside the game client.
         """
+        if not force and not getattr(self, "chat_logging", True):
+            return False
+
         conn = source or self.serverbound_source
 
         if conn is None:
             print(f"[CHAT FALLBACK] {message}")
-            return
+            return False
 
         try:
             await conn.write_packet(
                 clientbound.GeneralMessagePacket,
                 message=f"<J>[emirhankarakoc v1.10]</J> {message}",
             )
+            return True
         except Exception as exc:
             print(
                 f"[CHAT ERROR] "
                 f"{type(exc).__name__}: {exc}"
             )
+            return False
 
     @staticmethod
     def _player_name(player):
@@ -1502,6 +1647,57 @@ class TfmProxy(Proxy):
         )
 
     @pak.packet_listener(
+        clientbound.StartRoundCountdownPacket
+    )
+    async def on_start_round_countdown(
+        self,
+        source,
+        packet,
+    ):
+        previous_active = self.round_countdown_active
+        current_active = bool(
+            packet.activate_countdown
+        )
+        self.round_countdown_active = current_active
+        self.round_countdown_packet_seen = True
+
+        print(
+            "[COUNTDOWN EDGE] "
+            f"previous={previous_active} "
+            f"current={current_active} "
+            f"map=@{self.current_map} "
+            f"round={self.current_round_id}"
+        )
+
+        # In the records room the authoritative release sequence is
+        # True -> NewRound/Alive -> False. Start at that False edge and map the
+        # first saved left/right/jump checkpoint to the edge itself.
+        if (
+            previous_active
+            and not current_active
+            and self.awaiting_countdown_end
+            and self.selected_route is not None
+            and not self.replayer.is_active()
+        ):
+            release_time = asyncio.get_running_loop().time()
+            started = await self._start_selected_route_at_countdown_release(
+                release_time=release_time,
+            )
+
+            # The authoritative edge has already passed. If backend binding
+            # was unavailable, release the movement fallback instead of
+            # waiting forever for another False packet in the same round.
+            self.awaiting_countdown_end = False
+
+            print(
+                "[COUNTDOWN RELEASE] "
+                f"map=@{self.current_map} "
+                f"round={self.current_round_id} "
+                "firstControl=DIRECT-BACKEND-WRITE "
+                f"started={started}"
+            )
+
+    @pak.packet_listener(
         serverbound.JoinRoomPacket
     )
     async def on_join_room(
@@ -1516,6 +1712,8 @@ class TfmProxy(Proxy):
         old_round = self.current_round_id
 
         self.current_round_verified = False
+        self.pending_join_snapshot = True
+        self.current_round_join_snapshot = False
         self.self_enter_hole_context = None
         self.first_victory_session_id = None
 
@@ -1544,6 +1742,10 @@ class TfmProxy(Proxy):
         self.current_round_id = None
         self.current_map_hash = None
         self.current_map_width = 800.0
+        self.current_round_anchor_time = None
+        self.round_countdown_active = False
+        self.round_countdown_packet_seen = False
+        self.awaiting_countdown_end = False
 
         print(
             f"[ROUND CONTEXT] INVALIDATED room-change "
@@ -1566,6 +1768,18 @@ class TfmProxy(Proxy):
         source,
         packet,
     ):
+        # Capture this before SQLite, XML and terminal work. All saved event
+        # timestamps are scheduled against this one deterministic clock.
+        round_anchor_time = asyncio.get_running_loop().time()
+        self.current_round_anchor_time = round_anchor_time
+        self.awaiting_countdown_end = False
+
+        is_join_snapshot = bool(
+            self.pending_join_snapshot
+        )
+        self.pending_join_snapshot = False
+        self.current_round_join_snapshot = is_join_snapshot
+
         self.current_round_verified = False
         self.self_enter_hole_context = None
 
@@ -1626,7 +1840,15 @@ class TfmProxy(Proxy):
             .hexdigest()
         )
 
-        self.current_round_verified = True
+        self.current_round_verified = not is_join_snapshot
+
+        print(
+            "[ROUND VALIDATION] "
+            f"map=@{self.current_map} "
+            f"round={self.current_round_id} "
+            f"source={'JOIN-SNAPSHOT' if is_join_snapshot else 'FRESH-NEWROUND'} "
+            f"recordable={self.current_round_verified}"
+        )
 
         replacement_packet = None
 
@@ -1689,14 +1911,19 @@ class TfmProxy(Proxy):
             )
 
         if self.player_recorder.enabled:
-            self.player_recorder.start_map(
-                map_code=self.current_map,
-                mirrored=self.current_mirrored,
-                map_hash=self.current_map_hash,
-                round_id=self.current_round_id,
-            )
+            if self.current_round_verified:
+                self.player_recorder.start_map(
+                    map_code=self.current_map,
+                    mirrored=self.current_mirrored,
+                    map_hash=self.current_map_hash,
+                    round_id=self.current_round_id,
+                )
 
-            self._resolve_recordplayer_target()
+                self._resolve_recordplayer_target()
+            else:
+                self.player_recorder.invalidate_round(
+                    "joined-mid-round-snapshot"
+                )
 
         # Both persistent modes can learn from other players.
         self.winner_recorder.set_enabled(
@@ -1705,12 +1932,17 @@ class TfmProxy(Proxy):
             or self.afk_farming
         )
 
-        self.winner_recorder.new_round(
-            map_code=self.current_map,
-            mirrored=self.current_mirrored,
-            map_hash=self.current_map_hash,
-            round_id=self.current_round_id,
-        )
+        if self.current_round_verified:
+            self.winner_recorder.new_round(
+                map_code=self.current_map,
+                mirrored=self.current_mirrored,
+                map_hash=self.current_map_hash,
+                round_id=self.current_round_id,
+            )
+        else:
+            self.winner_recorder.invalidate_round(
+                "joined-mid-round-snapshot"
+            )
 
         self.first_victory_session_id = None
         self.selected_route = None
@@ -1724,35 +1956,78 @@ class TfmProxy(Proxy):
         # ALWAYS show the currently usable record at hand start.
         round_best = self._get_best_route_for_current_map()
 
+        # AFK farming owns autoplay when a route already exists.
+        if self.afk_farming and round_best is not None:
+            self.play_mode = True
+
+        # Prepare replay before any optional in-game status write. This also
+        # reuses round_best instead of querying SQLite a second time.
+        if self.play_mode:
+            self._load_play_for_current_map(
+                round_best,
+                route_checked=True,
+            )
+
+            if self.selected_route is not None:
+                if self.round_countdown_active:
+                    self.awaiting_countdown_end = True
+                    self.play_pending = False
+                    started = False
+                else:
+                    # Rooms that explicitly have no countdown release their
+                    # first real control directly from NewRound.
+                    started = self._start_selected_route(
+                        trigger="new-round-no-countdown",
+                        anchor_time=round_anchor_time,
+                        first_control_target_seconds=0.0,
+                        start_at_first_control=True,
+                    )
+
+                print(
+                    "[MAP START CLOCK] "
+                    f"map=@{self.current_map} "
+                    f"round={self.current_round_id} "
+                    f"countdownActive={self.round_countdown_active} "
+                    f"countdownPacketSeen={self.round_countdown_packet_seen} "
+                    f"waitingForFalseEdge={self.awaiting_countdown_end} "
+                    f"started={started}"
+                )
+
+        elif self.record_mode:
+            self._arm_record_for_current_map()
+
         if round_best is not None:
             owner = self._route_owner(round_best)
             seconds = self._route_seconds(round_best)
+            record_reference = self._route_record_reference(round_best)
 
-            await self._chat(
-                f"ROUND @{self.current_map} | "
-                f"BEST {seconds:.3f}s | "
-                f"owner={owner} | "
-                f"{len(round_best.get('events', []))} points"
+            asyncio.create_task(
+                self._chat(
+                    f"ROUND @{self.current_map} | "
+                    f"BEST {seconds:.3f}s | "
+                    f"owner={owner} | "
+                    f"{len(round_best.get('events', []))} points | "
+                    f"ID={record_reference}"
+                )
             )
 
             print(
                 f"[ROUND BEST] map=@{self.current_map} "
                 f"owner={owner} "
                 f"time={seconds:.3f}s "
-                f"points={len(round_best.get('events', []))}"
+                f"points={len(round_best.get('events', []))} "
+                f"ID={record_reference}"
             )
         else:
             print(
                 f"[ROUND BEST] map=@{self.current_map} NONE"
             )
 
-            await self._chat(
-                f"ROUND @{self.current_map} | NO SAVED RUN"
+            asyncio.create_task(
+                self._chat(
+                    f"ROUND @{self.current_map} | NO SAVED RUN"
+                )
             )
-
-        # AFK farming owns autoplay when a route already exists.
-        if self.afk_farming and round_best is not None:
-            self.play_mode = True
 
         self.afk_waiting_for_route = (
             self.afk_farming
@@ -1770,16 +2045,13 @@ class TfmProxy(Proxy):
             f"jumpPending={self.afk_jump_pending}"
         )
 
-        if self.play_mode:
-            self._load_play_for_current_map()
-
-        elif self.record_mode:
-            self._arm_record_for_current_map()
-
         if self.afk_farming and round_best is None:
-            await self._chat(
-                f"AFKFARMING @{self.current_map} | "
-                "no run: 1 jump at 5.00s; first eligible winner -> instant replay"
+            asyncio.create_task(
+                self._chat(
+                    f"AFKFARMING @{self.current_map} | "
+                    "no run: 1 jump at 5.00s; "
+                    "first eligible winner -> instant replay"
+                )
             )
 
         # Incoming packets are immutable in Caseus. Send a copied NewRound
@@ -1943,6 +2215,46 @@ class TfmProxy(Proxy):
             if argument_raw is not None
             else None
         )
+
+        # --------------------------
+        # /chatlogging on|off
+        # --------------------------
+
+        if command == "chatlogging":
+            if argument is None:
+                state = "ON" if self.chat_logging else "OFF"
+                print(f"[CHATLOGGING] {state}")
+                await self._chat(
+                    f"CHATLOGGING {state}",
+                    source,
+                    force=True,
+                )
+                return self.DO_NOTHING
+
+            if argument in ("on", "start"):
+                self.chat_logging = True
+                state = "ON"
+            elif argument in ("off", "stop"):
+                self.chat_logging = False
+                state = "OFF"
+            else:
+                await self._chat(
+                    "usage: /chatlogging on | off",
+                    source,
+                    force=True,
+                )
+                return self.DO_NOTHING
+
+            print(
+                f"[CHATLOGGING] {state} | "
+                "terminal logs remain enabled"
+            )
+            await self._chat(
+                f"CHATLOGGING {state} | terminal logs remain enabled",
+                source,
+                force=True,
+            )
+            return self.DO_NOTHING
 
         # --------------------------
         # /sismanlattrambolin on [width_px] [height_px] | off
@@ -2615,6 +2927,12 @@ class TfmProxy(Proxy):
                 else "OFF"
             )
 
+            chat_logging_status = (
+                "ON"
+                if self.chat_logging
+                else "OFF"
+            )
+
             sismanlat_trambolin_status = (
                 "ON"
                 if self.ground_resize_settings["trambolin"]["enabled"]
@@ -2646,9 +2964,15 @@ class TfmProxy(Proxy):
                     f"| PLAY={play_status} "
                     f"| AFKFARMING={afk_status} "
                     f"| CHATAFTERFIRST={chat_first_status} "
+                    f"| CHATLOGGING={chat_logging_status} "
                     f"| TRAMBOLIN={sismanlat_trambolin_status} "
                     f"| LAV={sismanlat_lav_status} "
                     f"| DEBUGLOGS={debug_status}"
+                ),
+
+                (
+                    "/chatlogging on/off | proxy durum mesajlarinin "
+                    "oyun chatine yazilmasini acar/kapatir; terminal acik kalir."
                 ),
 
                 (
@@ -3193,6 +3517,16 @@ class TfmProxy(Proxy):
 
             return
 
+        # Idle/heartbeat movement packets can arrive during 3-2-1. They are
+        # neither a release signal nor a valid fallback while the authoritative
+        # True -> False countdown edge is pending.
+        if (
+            self.play_mode
+            and self.awaiting_countdown_end
+            and self.selected_route is not None
+        ):
+            return self.DO_NOTHING
+
         # Most rooms already delivered Alive. This slow setup runs at most
         # once per life when that signal is missing or late.
         if not self.self_alive:
@@ -3219,8 +3553,9 @@ class TfmProxy(Proxy):
 
             return
 
-        # PLAY hot path: arm/start once, then block live movement while the
-        # saved trajectory owns the backend.
+        # PLAY hot path: NewRound normally started the route already. Movement
+        # is only a fallback when NewRound had no bound backend connection, or
+        # for a same-round respawn without a new map packet.
         if (
             self.play_mode
             and not self.auto_record_fallback
@@ -3230,25 +3565,10 @@ class TfmProxy(Proxy):
                 self.play_pending
                 and not self.replayer.is_active()
             ):
-                started = self.replayer.start(
-                    round_id=self.current_round_id,
+                started = self._start_selected_route(
+                    trigger="movement-fallback",
                     source_conn=source,
-                    self_session_id=self.self_session_id,
                 )
-
-                self.play_pending = (
-                    not started
-                )
-
-                if started:
-                    self.replay_started_this_round = True
-
-                    print(
-                        f"[REPLAY ROUND FLAG] "
-                        f"map=@{self.current_map} "
-                        "replayStartedThisRound=True "
-                        "source=movement"
-                    )
 
             if self.replayer.is_active():
                 return self.DO_NOTHING
@@ -3536,7 +3856,11 @@ class TfmProxy(Proxy):
             or self.current_map is None
             or self.current_round_id is None
         ):
-            invalid_reasons.append("new-round-not-observed")
+            invalid_reasons.append(
+                "joined-mid-round-snapshot"
+                if self.current_round_join_snapshot
+                else "new-round-not-observed"
+            )
 
         if is_self_victory and victory_map_code is None:
             invalid_reasons.append("missing-enter-hole-map")

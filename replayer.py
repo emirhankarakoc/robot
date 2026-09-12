@@ -70,6 +70,27 @@ class Replayer:
             self.active
         )
 
+    @staticmethod
+    def _first_control_index(events):
+        """Return the first checkpoint carrying an actual control state."""
+        for index, event in enumerate(events):
+            if (
+                bool(event.get("movingLeft", False))
+                or bool(event.get("movingRight", False))
+                or bool(event.get("jumping", False))
+            ):
+                return index
+
+        return 0
+
+    @classmethod
+    def _first_control_us(cls, events):
+        if events:
+            event = events[cls._first_control_index(events)]
+            return max(0, int(event.get("tUs", 0)))
+
+        return 0
+
     def stop(self, reason="stop"):
         self.generation += 1
         self.active = False
@@ -241,6 +262,31 @@ class Replayer:
             f"jump={bool(event.get('jumping', False))} "
             f"terminalHold={bool(event.get('terminalHold', False))}"
         )
+
+    async def _mirror_safely(
+        self,
+        *,
+        generation,
+        source_conn,
+        event,
+        self_session_id,
+    ):
+        """Mirror locally without holding the backend replay scheduler."""
+        if generation != self.generation:
+            return
+
+        try:
+            await self._mirror_to_local_client(
+                source_conn,
+                event,
+                self_session_id,
+                emit_debug=False,
+            )
+        except Exception as exc:
+            print(
+                "[LOCAL MIRROR ERROR] "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     @staticmethod
     def _infer_finish_direction(events):
@@ -547,6 +593,8 @@ class Replayer:
         source_conn,
         event,
         self_session_id,
+        *,
+        emit_debug=True,
     ):
         """
         LOCAL DISPLAY ONLY.
@@ -597,7 +645,7 @@ class Replayer:
             velocity_relative=False,
         )
 
-        if self.debug_logs:
+        if self.debug_logs and emit_debug:
             print(
                 "[TX->CLIENT] "
                 f"packet={type(local_move).__name__} "
@@ -622,7 +670,7 @@ class Replayer:
                     ),
                 )
 
-                if self.debug_logs:
+                if self.debug_logs and emit_debug:
                     print(
                         "[TX->CLIENT] "
                         f"packet={type(face_packet).__name__} "
@@ -639,7 +687,7 @@ class Replayer:
                     f"{type(exc).__name__}: {exc}"
                 )
 
-        if self.debug_logs:
+        if self.debug_logs and emit_debug:
             print(
                 f"[LOCAL MIRROR] "
                 f"{event.get('tUs', 0) / 1_000_000:.6f}s "
@@ -654,6 +702,11 @@ class Replayer:
         *,
         generation,
         anchor_time,
+        trim_initial_delay,
+        countdown_target_us,
+        start_at_first_control,
+        first_event_already_sent,
+        trigger,
         round_id,
         source_conn,
         self_session_id,
@@ -684,13 +737,87 @@ class Replayer:
 
             skipped_terminal = len(events) - len(play_events)
 
+            if start_at_first_control and play_events:
+                first_control_index = self._first_control_index(
+                    play_events
+                )
+
+                if first_control_index:
+                    print(
+                        "[PLAY COUNTDOWN END] "
+                        f"preControlCheckpointsSkipped={first_control_index}"
+                    )
+                    play_events = play_events[first_control_index:]
+
+            # Normal records-room playback is anchored to the authoritative
+            # countdown False edge. The first saved real control is mapped to
+            # that edge and all following recorded intervals are preserved.
+            #
+            # A movement-triggered start is retained only as a fallback for a
+            # missing backend connection or a same-round respawn. That trigger
+            # has already consumed the recorded leading interval, so only the
+            # fallback path removes the first timestamp.
+            timeline_shift_us = 0
+
+            if countdown_target_us is not None:
+                first_control_us = self._first_control_us(
+                    play_events
+                )
+                timeline_shift_us = (
+                    first_control_us
+                    - int(countdown_target_us)
+                )
+
+                print(
+                    "[PLAY 321 SYNC] "
+                    f"trigger={trigger} "
+                    f"recordedFirstControl={first_control_us / 1_000_000:.6f}s "
+                    f"targetFirstControl={int(countdown_target_us) / 1_000_000:.6f}s "
+                    f"timelineShift={timeline_shift_us / 1_000_000:+.6f}s"
+                )
+            elif trim_initial_delay:
+                timeline_shift_us = max(
+                    0,
+                    int(
+                        play_events[0].get(
+                            "tUs",
+                            0,
+                        )
+                    ),
+                )
+
+            if (
+                countdown_target_us is None
+                and trim_initial_delay
+                and timeline_shift_us
+            ):
+                print(
+                    "[PLAY FALLBACK SYNC] "
+                    f"trigger={trigger} "
+                    "removedRecordedLead="
+                    f"{timeline_shift_us / 1_000_000:.6f}s"
+                )
+            elif countdown_target_us is None and not trim_initial_delay:
+                print(
+                    "[PLAY NEWROUND SYNC] "
+                    f"trigger={trigger} "
+                    "recordedTimeline=PRESERVED "
+                    "firstCheckpoint="
+                    f"{max(0, int(play_events[0].get('tUs', 0))) / 1_000_000:.6f}s"
+                )
+
             if skipped_terminal:
                 print(
                     f"[PLAY] terminalHold checkpoint skipped "
                     f"count={skipped_terminal}"
                 )
 
-            for event in play_events:
+            deferred_debug = []
+
+            for event_index, event in enumerate(play_events):
+                if first_event_already_sent and event_index == 0:
+                    continue
+
                 if (
                     not self.active
                     or generation
@@ -700,11 +827,15 @@ class Replayer:
 
                 target = (
                     float(anchor_time)
-                    + int(
-                        event.get(
-                            "tUs",
-                            0,
+                    + max(
+                        0,
+                        int(
+                            event.get(
+                                "tUs",
+                                0,
+                            )
                         )
+                        - timeline_shift_us,
                     )
                     / 1_000_000.0
                 )
@@ -731,13 +862,7 @@ class Replayer:
                     round_id,
                 )
 
-                if self.debug_logs:
-                    self._log_server_packet(
-                        packet,
-                        event,
-                        reason="replay",
-                    )
-
+                write_started = loop.time()
                 await (
                     source_conn
                     .destination
@@ -745,37 +870,28 @@ class Replayer:
                         packet
                     )
                 )
+                write_finished = loop.time()
 
                 if self.debug_logs:
-                    print(
-                        f"[BACKEND WRITE OK] "
-                        f"{event.get('tUs', 0) / 1_000_000:.6f}s "
-                        f"x={event.get('x', 0.0):.2f} "
-                        f"y={event.get('y', 0.0):.2f}"
-                    )
-
-                # Local display must never kill backend replay.
-                try:
-                    await self._mirror_to_local_client(
-                        source_conn,
-                        event,
-                        self_session_id,
-                    )
-                except Exception as exc:
-                    print(
-                        "[LOCAL MIRROR ERROR] "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-                if self.debug_logs:
-                    print(
-                        f"[PLAY POS] "
+                    deferred_debug.append(
+                        "[BACKEND WRITE OK DEFERRED] "
                         f"{event.get('tUs', 0) / 1_000_000:.6f}s "
                         f"x={event.get('x', 0.0):.2f} "
                         f"y={event.get('y', 0.0):.2f} "
-                        f"face="
-                        f"{'R' if event.get('facingRight', True) else 'L'}"
+                        f"lateMs={max(0.0, (write_started - target) * 1000.0):.3f} "
+                        f"writeMs={(write_finished - write_started) * 1000.0:.3f}"
                     )
+
+                # Client-only mirror I/O must never hold the backend timing
+                # loop. It runs independently after the backend write.
+                loop.create_task(
+                    self._mirror_safely(
+                        generation=generation,
+                        source_conn=source_conn,
+                        event=event,
+                        self_session_id=self_session_id,
+                    )
+                )
 
             # IMPORTANT V1.9:
             #
@@ -810,6 +926,14 @@ class Replayer:
                 "waiting for victory/death"
             )
 
+            if deferred_debug:
+                print(
+                    "[PLAY DEBUG TRACE] deferred until trajectory complete "
+                    f"count={len(deferred_debug)}"
+                )
+                for debug_line in deferred_debug:
+                    print(debug_line)
+
         except asyncio.CancelledError:
             return
 
@@ -821,12 +945,112 @@ class Replayer:
 
             self.active = False
 
+    async def start_at_countdown_release(
+        self,
+        *,
+        round_id,
+        source_conn,
+        self_session_id=None,
+        release_time=None,
+    ):
+        """Write the first real control before logs, mirrors or task hops."""
+        if self.record is None:
+            return False
+
+        if source_conn is None or source_conn.destination is None:
+            return False
+
+        events = self.record.get("events", [])
+        play_events = [
+            event
+            for event in events
+            if not bool(event.get("terminalHold", False))
+        ]
+
+        if not play_events:
+            play_events = events
+
+        if not play_events:
+            return False
+
+        first_control_index = self._first_control_index(play_events)
+        first_event = play_events[first_control_index]
+
+        loop = asyncio.get_running_loop()
+        anchor_time = (
+            loop.time()
+            if release_time is None
+            else float(release_time)
+        )
+
+        self.generation += 1
+        generation = self.generation
+        self.active = True
+
+        packet = self._build_packet(first_event, int(round_id))
+        write_started = loop.time()
+
+        try:
+            await source_conn.destination.write_packet_instance(packet)
+        except Exception as exc:
+            self.active = False
+            print(
+                "[PLAY RELEASE WRITE ERROR] "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+        write_finished = loop.time()
+
+        # Continue with absolute times. The first event is already on the
+        # backend and is skipped by _run; the second keeps its exact recorded
+        # interval from the first control.
+        self.task = loop.create_task(
+            self._run(
+                generation=generation,
+                anchor_time=anchor_time,
+                trim_initial_delay=False,
+                countdown_target_us=0,
+                start_at_first_control=True,
+                first_event_already_sent=True,
+                trigger="countdown-false-edge-direct",
+                round_id=int(round_id),
+                source_conn=source_conn,
+                self_session_id=self_session_id,
+            )
+        )
+
+        loop.create_task(
+            self._mirror_safely(
+                generation=generation,
+                source_conn=source_conn,
+                event=first_event,
+                self_session_id=self_session_id,
+            )
+        )
+
+        print(
+            "[PLAY RELEASE WRITE] "
+            f"id={self.record.get('id')} "
+            f"round={round_id} "
+            f"edgeToWriteMs={max(0.0, (write_started - anchor_time) * 1000.0):.3f} "
+            f"writeMs={(write_finished - write_started) * 1000.0:.3f} "
+            "hotPath=BACKEND-FIRST"
+        )
+
+        return True
+
     def start(
         self,
         *,
         round_id,
         source_conn,
         self_session_id=None,
+        anchor_time=None,
+        trim_initial_delay=True,
+        countdown_target_seconds=None,
+        start_at_first_control=False,
+        trigger="movement-fallback",
     ):
         if self.record is None:
             print(
@@ -861,14 +1085,29 @@ class Replayer:
 
         self.active = True
 
-        anchor_time = (
-            loop.time()
+        if anchor_time is None:
+            anchor_time = loop.time()
+        else:
+            anchor_time = float(anchor_time)
+
+        countdown_target_us = (
+            None
+            if countdown_target_seconds is None
+            else max(
+                0,
+                int(float(countdown_target_seconds) * 1_000_000),
+            )
         )
 
         self.task = loop.create_task(
             self._run(
                 generation=generation,
                 anchor_time=anchor_time,
+                trim_initial_delay=bool(trim_initial_delay),
+                countdown_target_us=countdown_target_us,
+                start_at_first_control=bool(start_at_first_control),
+                first_event_already_sent=False,
+                trigger=str(trigger),
                 round_id=int(round_id),
                 source_conn=source_conn,
                 self_session_id=self_session_id,

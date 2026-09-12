@@ -1,5 +1,112 @@
-emirhankarakoc v1.15
+emirhankarakoc v1.19
 ===================
+
+JOIN SNAPSHOT GUARD V16
+-----------------------
+
+The first NewRound delivered after an explicit JoinRoom is the current hand's
+join snapshot. It does not prove that the proxy was present when that hand
+started. The snapshot hand is now marked recordable=False and all SELF,
+selected-player and passive-winner saves are rejected with:
+
+    reason=joined-mid-round-snapshot
+
+WinnerRecorder and PlayerRecorder receive no map context for that hand, so a
+partial trajectory cannot reach SQLite even if its apparent elapsed time is
+above the minimum. The following NewRound is marked FRESH-NEWROUND and normal
+recording resumes automatically. Playback of an existing route remains allowed
+on the snapshot hand.
+
+BACKEND FIRST V15
+-----------------
+
+At the countdown True-to-False release edge, the first real control packet is
+now written directly to the backend socket before any terminal log, local
+mirror write, or asyncio task hop. The remaining checkpoints keep absolute
+deadlines relative to that release write.
+
+Local-client mirror writes no longer block the backend scheduler. Per-packet
+debug trace lines are buffered and printed after the trajectory completes.
+The release log reports the remaining local overhead explicitly:
+
+    [PLAY RELEASE WRITE] ... edgeToWriteMs=... writeMs=... hotPath=BACKEND-FIRST
+
+When edgeToWriteMs is near zero, remaining race variation is outside the replay
+decision path (network latency/server tick/physics).
+
+COUNTDOWN EDGE SYNC V14
+-----------------------
+
+The records room emits StartRoundCountdownPacket with this observed order:
+
+    True -> NewRound -> Alive -> False
+
+The False transition is the authoritative controls-release edge. Playback now
+waits for that exact True-to-False transition. All idle checkpoints before the
+saved route's first real left/right/jump state are skipped, and that first real
+control packet is sent immediately on the False edge. No fixed three-second
+estimate and no client heartbeat/movement trigger is used.
+
+If a room starts a NewRound without an active countdown, the first real control
+is anchored directly to NewRound instead.
+
+NEWROUND CLOCK SYNC V13
+-----------------------
+
+V14 supersedes V13's fixed NewRound + 3.000-second estimate with the observed
+StartRoundCountdown True-to-False release edge.
+
+Every saved checkpoint is now scheduled against the exact monotonic instant
+when NewRoundPacket reaches the proxy. The first checkpoint that contains a
+real left/right/jump control is normalized to exactly NewRound + 3.000 seconds,
+and all recorded intervals around it are preserved. A recorded first control at
+2.952 or 3.131 seconds therefore starts at exactly 3.000 seconds every round.
+
+StartRoundCountdownPacket is tracked as the room's countdown ON/OFF setting;
+it is not treated as a countdown-finished event. Movement-triggered playback
+remains only as a fallback when no backend connection existed at NewRound or
+for a same-round respawn.
+
+COUNTDOWN SYNC V12
+------------------
+
+V13 supersedes V12's variable first-client-movement trigger with the fixed
+NewRound clock.
+
+MAP START SYNC V11
+------------------
+
+V12 supersedes V11's Alive-triggered playback with a countdown-synchronized
+first-client-movement trigger.
+
+MAP START FAST V10
+------------------
+
+Saved playback is selected once during NewRound and starts on the server's
+Alive signal. The first outgoing client movement remains a fallback for rooms
+that do not send Alive reliably.
+
+V12 removes the saved leading timestamp only after the current client has sent
+its first post-countdown movement packet. Every later interval remains
+unchanged. NewRound status chat cannot delay delivery of the map packet.
+
+CHAT LOGGING + ROUND BEST ID
+----------------------------
+
+    /chatlogging off
+    /chatlogging on
+
+This controls every local proxy/status message injected into the game chat.
+Terminal logs remain enabled. Real room messages configured with
+/chatafterfirst are independent and are not suppressed.
+
+Every new-map BEST message ends with the exact deletable record reference:
+
+    ROUND @940 | BEST 8.508s | owner=K1ng#9463 | 77 points | ID=PLAYER:12
+
+Delete it immediately with:
+
+    /timedelete PLAYER:12
 
 ROUND / MAP RECORD GUARD
 ------------------------
@@ -167,7 +274,7 @@ MINIMUM TIME
 
 Any route shorter than:
 
-     7.000 seconds
+    6.400 seconds
 
 is rejected and never becomes replay data.
 
@@ -264,7 +371,7 @@ When ON:
        the learned route is armed
        if we are still alive it starts immediately in the SAME hand.
 
-Blacklisted winners and records shorter than 8 seconds are not used.
+Blacklisted winners and records shorter than 6.4 seconds are not used.
 
 
 TIME COMMANDS
@@ -448,7 +555,7 @@ V1.5
 ====
 
 Minimum record time:
-    7.000 seconds
+    6.400 seconds
 
 /timelist
     Shows ALL saved map codes and their fastest usable BEST.

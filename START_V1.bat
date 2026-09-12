@@ -14,6 +14,7 @@ echo   /play on ^| off
 echo   /sismanlattrambolin on [W] [H] [gorunmezacik^|gorunmezkapali] ^| off
 echo   /sismanlatlav on [W] [H] [gorunmezacik^|gorunmezkapali] ^| off
 echo   /debuglogs on ^| off
+echo   /chatlogging on ^| off
 echo   /chatafterfirst on ^| off ^| [message]
 echo   /afkfarming on ^| off
 echo   /recordplayer Nick#0000 ^| off
@@ -24,7 +25,7 @@ echo   /timedelete [ID^|@mapCode^|all]
 echo   /timeowner @mapCode Nick#0000
 echo   /blacklist add/remove/list/clear [Nick#0000]
 echo.
-echo BEST only. Minimum record time: 8.000 seconds.
+echo BEST only. Minimum record time: 6.400 seconds.
 echo.
 
 py -3.11 main.py

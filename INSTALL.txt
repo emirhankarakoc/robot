@@ -1,6 +1,57 @@
 ROBOT HOTLINE + SISMANLAT
 ========================
 
+JOIN SNAPSHOT GUARD V16:
+    JoinRoom'dan sonra gelen ilk NewRound, devam eden elin client snapshot'idir;
+    gercek round baslangici sayilmaz. Bu elde SELF, recordplayer ve passive
+    winner kayitlari joined-mid-round-snapshot sebebiyle tamamen atlanir.
+    Sonraki NewRound FRESH-NEWROUND olarak normal kaydi otomatik acar. Mevcut
+    kaydi join snapshot mapinde oynatma davranisi korunur.
+
+BACKEND FIRST V15:
+    Countdown False kenarinda ilk gercek kontrol paketi; terminal logu, local
+    mirror ve asyncio task hopundan once direkt backend soketine yazilir. Kalan
+    checkpointler absolute deadline ile gider. Local mirror backend scheduleri
+    bekletmez; debug satirlari rota bittikten sonra basilir.
+    PLAY RELEASE WRITE satirindaki edgeToWriteMs kodun karar gecikmesini,
+    writeMs ise local socket yazma suresini gosterir.
+
+COUNTDOWN EDGE SYNC V14:
+    Records odasinda gozlenen paket sirasi True -> NewRound -> Alive -> False.
+    False paketi kontrollerin acildigi authoritative kenardir. Replay artik bu
+    True-to-False gecisini bekler; kayittaki ilk gercek sol/sag/jump paketi tam
+    False kenarinda aninda gonderilir. Onceki bos/idle checkpointler atlanir.
+    Sabit 3.000 saniye tahmini ve client movement tetigi kullanilmaz.
+
+NEWROUND CLOCK SYNC V13:
+    V14, V13'un NewRound+3.000s tahminini gercek countdown False kenariyla
+    degistirir.
+
+COUNTDOWN SYNC V12:
+    V13 bu degisken movement tetigini sabit NewRound saatiyle degistirir.
+
+MAP START SYNC V11:
+    V12, V11'in Alive + preserved delay davranisinin yerine countdown sonu
+    movement sinyalini kullanir.
+
+MAP START FAST V10:
+    Kayitli rota NewRound sirasinda tek SQLite sorgusuyla hazirlanir.
+    Server Alive sinyali gelir gelmez replay baslar; ilk client movement
+    yalniz Alive gelmeyen odalar icin fallback olarak kalir.
+    V11 duzeltmesiyle ilk checkpoint'in kayitli baslangic zamani da korunur.
+    Sonraki tum kayitli zaman araliklari aynen kalir.
+    Yeni mapteki ROUND chat mesaji map packet'inin iletilmesini bekletmez.
+
+MINIMUM RECORD TIME:
+    SELF, recordplayer ve winner/autolearn kayitlarinin minimum kabul suresi
+    6.400 saniyedir.
+
+CHATLOGGING + ROUND ID V9:
+    ./chatlogging off tum proxy/status mesajlarini oyun chatinde susturur.
+    ./chatlogging on mesajlari yeniden acar. Terminal loglari acik kalir.
+    Her map basindaki ROUND BEST mesaji points sonrasinda exact kayit ID'sini
+    gosterir: ID=SELF:12 veya ID=PLAYER:7. Bu ID ./timedelete ID ile silinir.
+
 ROUND MATCH GUARD V8:
     Proxy o roundun NewRoundPacket bilgisini gormediyse kayit alinmaz.
     SELF victory icin EnterHolePacket mapCode+roundId degeri NewRoundPacket ile

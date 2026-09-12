@@ -10,7 +10,7 @@ class RecordStore:
 
     Rules:
       - lifecycle v3 only
-      - minimum replayable time: 8.000 seconds
+      - minimum replayable time: 6.400 seconds
       - one BEST record per exact map identity
       - SELF and learned PLAYER routes compete for that one BEST
       - blacklist is persistent
@@ -18,7 +18,7 @@ class RecordStore:
     """
 
     LIFE_TIMER_VERSION = 3
-    MIN_RECORD_SECONDS = 7.0
+    MIN_RECORD_SECONDS = 6.4
 
     def __init__(self, db_path="robot_records.db"):
         self.db_path = Path(db_path)
@@ -663,6 +663,7 @@ class RecordStore:
 
         record = json.loads(best["payload_json"])
         record["id"] = best["id"]
+        record["source"] = best["source"]
         record.setdefault("mirrored", bool(mirrored))
         record.setdefault("mapHash", str(map_hash))
         record.setdefault("targetName", best["name"])
