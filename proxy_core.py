@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import time
+import xml.etree.ElementTree as ET
+from decimal import Decimal, InvalidOperation
 
 import pak
 
@@ -106,6 +108,25 @@ class TfmProxy(Proxy):
         self.current_mirrored = False
         self.current_map_hash = None
 
+        # Client-only ground size overrides applied once per NewRound.
+        # Trampoline and lava keep independent on/off and L/H values.
+        self.ground_resize_settings = {
+            "trambolin": {
+                "ground_type": "2",
+                "enabled": False,
+                "width_px": Decimal("0.5"),
+                "height_px": Decimal("0.5"),
+                "force_invisible": False,
+            },
+            "lav": {
+                "ground_type": "3",
+                "enabled": False,
+                "width_px": Decimal("0.5"),
+                "height_px": Decimal("0.5"),
+                "force_invisible": False,
+            },
+        }
+
         self.self_alive = False
 
         # Records/racing rooms can emit a fresh PlayerUpdate Alive on
@@ -140,10 +161,237 @@ class TfmProxy(Proxy):
         print(
             "[PROXY] emirhankarakoc v1.10 listeners ready"
         )
+        print(
+            "[GROUND RESIZE] OVERLAY-V4 | NO LIMIT | "
+            "/sismanlattrambolin + /sismanlatlav"
+        )
 
     # ==============================================================
     # HELPERS
     # ==============================================================
+
+    @staticmethod
+    def _format_xml_number(value):
+        decimal_value = (
+            value
+            if isinstance(value, Decimal)
+            else Decimal(str(value))
+        )
+        text = format(decimal_value, "f")
+
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+
+        return "0" if text in ("", "-0") else text
+
+    def _expand_configured_grounds(self, xml):
+        """
+        Increase L and H for enabled ground types in the client XML.
+
+        The original server XML is retained for map hashing and route lookup.
+        Editing the existing ground avoids invalid sub-10px helper grounds and
+        also works for dynamic grounds.
+        """
+        try:
+            root = ET.fromstring(xml)
+        except (ET.ParseError, TypeError, ValueError):
+            return xml, {}
+
+        enabled_by_type = {
+            setting["ground_type"]: setting
+            for setting in self.ground_resize_settings.values()
+            if setting["enabled"]
+        }
+        changed_counts = {
+            ground_type: 0
+            for ground_type in enabled_by_type
+        }
+
+        # Work from a snapshot of each ground container. Invisible mode adds
+        # a new ground, so newly appended overlays must not be processed again.
+        for container in root.iter("S"):
+            grounds = [
+                child
+                for child in list(container)
+                if child.tag == "S"
+            ]
+
+            for ground in grounds:
+                ground_type = ground.attrib.get("T")
+                setting = enabled_by_type.get(ground_type)
+
+                if setting is None:
+                    continue
+
+                try:
+                    length = Decimal(ground.attrib["L"])
+                    height = Decimal(ground.attrib["H"])
+                except (InvalidOperation, KeyError, TypeError, ValueError):
+                    continue
+
+                expanded_length = self._format_xml_number(
+                    length + setting["width_px"]
+                )
+                expanded_height = self._format_xml_number(
+                    height + setting["height_px"]
+                )
+
+                if setting["force_invisible"]:
+                    # Preserve the original visible ground. The enlarged
+                    # collision layer is a separate invisible overlay.
+                    attributes = dict(ground.attrib)
+                    attributes.pop("lua", None)
+                    attributes.pop("i", None)
+                    attributes["L"] = expanded_length
+                    attributes["H"] = expanded_height
+                    attributes["m"] = ""
+                    container.append(
+                        ET.Element("S", attributes)
+                    )
+                else:
+                    ground.attrib["L"] = expanded_length
+                    ground.attrib["H"] = expanded_height
+
+                changed_counts[ground_type] += 1
+
+        if not any(changed_counts.values()):
+            return xml, changed_counts
+
+        return (
+            ET.tostring(
+                root,
+                encoding="unicode",
+                short_empty_elements=True,
+            ),
+            changed_counts,
+        )
+
+    async def _configure_ground_resize(
+        self,
+        setting_key,
+        command_name,
+        argument_raw,
+        source,
+    ):
+        setting = self.ground_resize_settings[setting_key]
+
+        if argument_raw is None:
+            state = "ON" if setting["enabled"] else "OFF"
+            await self._chat(
+                f"{command_name.upper()}={state} | "
+                f"width=+{self._format_xml_number(setting['width_px'])}px | "
+                f"height=+{self._format_xml_number(setting['height_px'])}px | "
+                f"invisible={'ON' if setting['force_invisible'] else 'OFF'} | "
+                "range=>0, no upper limit | applies on next map",
+                source,
+            )
+            return
+
+        tokens = argument_raw.split()
+        action = tokens[0].lower()
+        visibility_values = {
+            "gorunmezacik": True,
+            "gorunmezkapali": False,
+        }
+
+        if action in visibility_values and len(tokens) == 1:
+            setting["force_invisible"] = visibility_values[action]
+            visibility_state = (
+                "ON"
+                if setting["force_invisible"]
+                else "OFF"
+            )
+            await self._chat(
+                f"{command_name.upper()} INVISIBLE={visibility_state} | "
+                "applies on next map",
+                source,
+            )
+            print(
+                f"[{command_name.upper()}] "
+                f"INVISIBLE={visibility_state}"
+            )
+            return
+
+        if action in ("off", "stop") and len(tokens) == 1:
+            setting["enabled"] = False
+            await self._chat(
+                f"{command_name.upper()} OFF | "
+                "current map unchanged; next map normal",
+                source,
+            )
+            print(f"[{command_name.upper()}] OFF")
+            return
+
+        if action not in ("on", "start"):
+            await self._chat(
+                f"usage: /{command_name} on [width_px] [height_px] "
+                "[gorunmezacik|gorunmezkapali] | off",
+                source,
+            )
+            return
+
+        value_tokens = tokens[1:]
+        requested_visibility = None
+
+        if value_tokens and value_tokens[-1].lower() in visibility_values:
+            visibility_token = value_tokens.pop().lower()
+            requested_visibility = visibility_values[visibility_token]
+
+        if len(value_tokens) > 2:
+            await self._chat(
+                f"usage: /{command_name} on [width_px] [height_px] "
+                "[gorunmezacik|gorunmezkapali] | off",
+                source,
+            )
+            return
+
+        requested_values = []
+
+        for value_text in value_tokens:
+            try:
+                requested_value = Decimal(value_text)
+            except InvalidOperation:
+                requested_value = None
+
+            if (
+                requested_value is None
+                or not requested_value.is_finite()
+                or requested_value <= 0
+            ):
+                await self._chat(
+                    f"{command_name.upper()} values must be "
+                    "positive finite numbers",
+                    source,
+                )
+                return
+
+            requested_values.append(requested_value.normalize())
+
+        if requested_values:
+            setting["width_px"] = requested_values[0]
+            setting["height_px"] = requested_values[0]
+
+        if len(requested_values) == 2:
+            setting["height_px"] = requested_values[1]
+
+        if requested_visibility is not None:
+            setting["force_invisible"] = requested_visibility
+
+        setting["enabled"] = True
+        await self._chat(
+            f"{command_name.upper()} ON | "
+            f"L+{self._format_xml_number(setting['width_px'])}px "
+            f"H+{self._format_xml_number(setting['height_px'])}px | "
+            f"INVISIBLE={'ON' if setting['force_invisible'] else 'OFF'} | "
+            "OVERLAY V4 | NO LIMIT | applies on next map",
+            source,
+        )
+        print(
+            f"[{command_name.upper()}] ON "
+            f"widthGrowth={self._format_xml_number(setting['width_px'])}px "
+            f"heightGrowth={self._format_xml_number(setting['height_px'])}px "
+            f"invisible={setting['force_invisible']}"
+        )
 
     def _bind_source(
         self,
@@ -1139,6 +1387,38 @@ class TfmProxy(Proxy):
             .hexdigest()
         )
 
+        replacement_packet = None
+
+        ground_resize_enabled = any(
+            setting["enabled"]
+            for setting in self.ground_resize_settings.values()
+        )
+
+        if ground_resize_enabled and xml:
+            (
+                client_xml,
+                changed_counts,
+            ) = self._expand_configured_grounds(xml)
+
+            if any(changed_counts.values()):
+                replacement_packet = packet.copy(
+                    xml=client_xml
+                )
+
+            for setting_key, setting in self.ground_resize_settings.items():
+                if not setting["enabled"]:
+                    continue
+
+                print(
+                    f"[SISMANLAT{setting_key.upper()}] "
+                    f"map=@{self.current_map} "
+                    f"grounds={changed_counts.get(setting['ground_type'], 0)} "
+                    f"widthGrowth={self._format_xml_number(setting['width_px'])}px "
+                    f"heightGrowth={self._format_xml_number(setting['height_px'])}px "
+                    f"invisible={setting['force_invisible']} "
+                    f"mode={'overlay' if setting['force_invisible'] else 'direct'}"
+                )
+
         print(
             f"[MAP] "
             f"map={self.current_map} "
@@ -1244,6 +1524,23 @@ class TfmProxy(Proxy):
                 f"AFKFARMING @{self.current_map} | "
                 "no run: 1 jump at 5.00s; first eligible winner -> instant replay"
             )
+
+        # Incoming packets are immutable in Caseus. Send a copied NewRound
+        # packet to the local client and suppress only the original packet.
+        # On failure, return normally so the untouched server packet is still
+        # forwarded instead of breaking the round.
+        if replacement_packet is not None:
+            try:
+                await source.destination.write_packet_instance(
+                    replacement_packet
+                )
+                return self.DO_NOTHING
+            except Exception as exc:
+                print(
+                    "[SISMANLAT ERROR] "
+                    f"{type(exc).__name__}: {exc} | "
+                    "original map forwarded"
+                )
 
     # ==============================================================
     # ALIVE / DEAD FROM SERVER
@@ -1389,6 +1686,25 @@ class TfmProxy(Proxy):
             if argument_raw is not None
             else None
         )
+
+        # --------------------------
+        # /sismanlattrambolin on [width_px] [height_px] | off
+        # /sismanlatlav on [width_px] [height_px] | off
+        # --------------------------
+
+        ground_resize_commands = {
+            "sismanlattrambolin": "trambolin",
+            "sismanlatlav": "lav",
+        }
+
+        if command in ground_resize_commands:
+            await self._configure_ground_resize(
+                ground_resize_commands[command],
+                command,
+                argument_raw,
+                source,
+            )
+            return self.DO_NOTHING
 
         # --------------------------
         # /debuglogs on|off
@@ -1969,6 +2285,18 @@ class TfmProxy(Proxy):
                 else "OFF"
             )
 
+            sismanlat_trambolin_status = (
+                "ON"
+                if self.ground_resize_settings["trambolin"]["enabled"]
+                else "OFF"
+            )
+
+            sismanlat_lav_status = (
+                "ON"
+                if self.ground_resize_settings["lav"]["enabled"]
+                else "OFF"
+            )
+
             recordplayer_target = (
                 self.player_recorder.target_name
             )
@@ -1988,7 +2316,21 @@ class TfmProxy(Proxy):
                     f"| PLAY={play_status} "
                     f"| AFKFARMING={afk_status} "
                     f"| CHATAFTERFIRST={chat_first_status} "
+                    f"| TRAMBOLIN={sismanlat_trambolin_status} "
+                    f"| LAV={sismanlat_lav_status} "
                     f"| DEBUGLOGS={debug_status}"
+                ),
+
+                (
+                    "/sismanlattrambolin on [width_px] [height_px] "
+                    "[gorunmezacik|gorunmezkapali] | "
+                    "trambolinleri client'ta buyutur; off ile kapanir."
+                ),
+
+                (
+                    "/sismanlatlav on [width_px] [height_px] "
+                    "[gorunmezacik|gorunmezkapali] | "
+                    "lavlari client'ta buyutur; off ile kapanir."
                 ),
 
                 (

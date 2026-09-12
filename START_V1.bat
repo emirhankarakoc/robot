@@ -11,6 +11,8 @@ echo Commands:
 echo   /help
 echo   /record on ^| off
 echo   /play on ^| off
+echo   /sismanlattrambolin on [W] [H] [gorunmezacik^|gorunmezkapali] ^| off
+echo   /sismanlatlav on [W] [H] [gorunmezacik^|gorunmezkapali] ^| off
 echo   /debuglogs on ^| off
 echo   /chatafterfirst on ^| off ^| [message]
 echo   /afkfarming on ^| off

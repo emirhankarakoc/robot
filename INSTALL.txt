@@ -1,0 +1,34 @@
+ROBOT HOTLINE + SISMANLAT
+========================
+
+1. Bu paketteki .py dosyalarini mevcut robot klasorunuza kopyalayin.
+2. Mevcut robot_records.db dosyanizi silmeyin veya degistirmeyin.
+3. START_V1.bat ile calistirin.
+
+Komutlar:
+    ./sismanlattrambolin on
+    ./sismanlattrambolin on 0.5
+    ./sismanlattrambolin on 0.05 0.10
+    ./sismanlattrambolin on 0.05 0.10 gorunmezacik
+    ./sismanlattrambolin gorunmezkapali
+    ./sismanlattrambolin off
+
+    ./sismanlatlav on
+    ./sismanlatlav on 0.5
+    ./sismanlatlav on 0.05 0.10
+    ./sismanlatlav on 0.05 0.10 gorunmezacik
+    ./sismanlatlav gorunmezkapali
+    ./sismanlatlav off
+
+Degisiklik mevcut roundu yeniden yuklemez; bir sonraki haritada uygulanir.
+Bir deger verilirse hem L hem H degerine eklenir. Iki deger verilirse ilk
+deger L/genislige, ikinci deger H/yukseklige eklenir. Ornek:
+./sismanlatlav on 0.05 0.10 => L+0.05px, H+0.10px.
+
+Degisiklik client-only'dir. Original map XML/hash ve backend degismez.
+0.01 alt limiti ve 10 ust limiti yoktur. Sadece pozitif ve sonlu sayilar
+kabul edilir.
+
+gorunmezacik, orijinal gorunen zemini korur ve buyutulmus fizik katmanini ayri
+bir m="" gorunmez kopya olarak ekler. Boylece sadece eklenen buyume gorunmez;
+orijinal blok gorunur kalir. gorunmezkapali orijinal zemini dogrudan buyutur.

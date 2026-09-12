@@ -19,6 +19,8 @@ def main():
     print("[COMMAND] /help")
     print("[COMMAND] /record on | off")
     print("[COMMAND] /play on | off")
+    print("[COMMAND] /sismanlattrambolin on [W] [H] [gorunmezacik|gorunmezkapali] | off")
+    print("[COMMAND] /sismanlatlav on [W] [H] [gorunmezacik|gorunmezkapali] | off")
     print("[COMMAND] /debuglogs on | off")
     print("[COMMAND] /chatafterfirst on | off | [message]")
     print("[COMMAND] /afkfarming on | off")

@@ -1,6 +1,52 @@
 emirhankarakoc v1.15
 ===================
 
+TRAMPOLINE + LAVA SIZE OVERRIDE (CLIENT ONLY)
+---------------------------------------------
+
+    /sismanlattrambolin on
+    /sismanlattrambolin on 0.5
+    /sismanlattrambolin on 0.05 0.10
+    /sismanlattrambolin on 0.05 0.10 gorunmezacik
+    /sismanlattrambolin gorunmezkapali
+    /sismanlattrambolin off
+
+    /sismanlatlav on
+    /sismanlatlav on 0.5
+    /sismanlatlav on 0.05 0.10
+    /sismanlatlav on 0.05 0.10 gorunmezacik
+    /sismanlatlav gorunmezkapali
+    /sismanlatlav off
+
+Syntax:
+
+    /sismanlattrambolin on [width_px] [height_px] [gorunmezacik|gorunmezkapali]
+    /sismanlatlav on [width_px] [height_px] [gorunmezacik|gorunmezkapali]
+
+The commands increase the matching ground's L and H values in the XML sent to
+the local client. Trampoline (T=2) and lava (T=3) have independent on/off and
+size settings. Default width and height additions are 0.5px for each.
+
+With one value, the same addition is used for both L and H. With two values,
+the first is added to L (width) and the second to H (height). These are total
+dimension additions: L=20 with width_px=0.5 becomes L=20.5. Decimal values
+of any positive finite size are accepted, although very small changes may be
+rounded by Flash.
+
+gorunmezacik preserves the original visible ground and adds the enlarged
+client-side physics layer as a separate m="" invisible overlay. Therefore the
+original trampoline/lava artwork stays visible and only the added enlargement
+is hidden. gorunmezkapali directly enlarges the original ground instead.
+Visibility mode can also be changed without changing the saved size values:
+
+    /sismanlatlav gorunmezacik
+    /sismanlatlav gorunmezkapali
+
+The setting is applied when the next map loads. It changes only the NewRound
+XML sent to the local client. The original XML is still used for map hashing,
+record lookup and the backend. Existing grounds are edited directly, so static
+and dynamic trampoline/lava grounds are both supported.
+
 CHAT PREFIX
 -----------
 
