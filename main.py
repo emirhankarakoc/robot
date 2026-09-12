@@ -14,7 +14,7 @@ def main():
     print(f"[LISTEN] SATELLITE {HOST}:{SATELLITE_PORT}")
     print("[DB] robot_records.db")
     print("[RULE] BEST only")
-    print("[RULE] minimum record = 8.000s")
+    print("[RULE] minimum record =  7.000s")
     print()
     print("[COMMAND] /help")
     print("[COMMAND] /record on | off")

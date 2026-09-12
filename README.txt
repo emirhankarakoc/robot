@@ -167,7 +167,7 @@ MINIMUM TIME
 
 Any route shorter than:
 
-    8.000 seconds
+     7.000 seconds
 
 is rejected and never becomes replay data.
 
@@ -448,7 +448,7 @@ V1.5
 ====
 
 Minimum record time:
-    8.000 seconds
+    7.000 seconds
 
 /timelist
     Shows ALL saved map codes and their fastest usable BEST.

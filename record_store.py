@@ -18,7 +18,7 @@ class RecordStore:
     """
 
     LIFE_TIMER_VERSION = 3
-    MIN_RECORD_SECONDS = 8.0
+    MIN_RECORD_SECONDS = 7.0
 
     def __init__(self, db_path="robot_records.db"):
         self.db_path = Path(db_path)
